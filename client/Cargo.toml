@@ -1,0 +1,86 @@
+[package]
+name = "rebleach-client"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "rebleach-client"
+path = "src/main.rs"
+
+[lib]
+name = "rebleach_client"
+path = "src/lib.rs"
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+tokio-tungstenite = { version = "0.26", features = ["rustls-tls-webpki-roots"] }
+# 信令走 wss://，内置 pin 服务端自签 CA
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+rustls-pemfile = "2"
+futures-util = "0.3"
+bytes = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"
+thiserror = "1"
+parking_lot = "0.12"
+base64 = "0.22"
+clap = { version = "4", features = ["derive"] }
+
+# === TOFU 身份校验（ed25519 设备密钥 + SDP 签名） ===
+ed25519-dalek = { version = "2", features = ["rand_core"] }
+rand = "0.8"
+
+# === 输入注入（被控端） ===
+enigo = "0.6"
+
+# === 主控端查看器 ===
+winit = "0.30"
+softbuffer = "0.4"
+
+# === 核心：屏幕采集 ===
+# 自研 Windows Graphics Capture + ID3D11VideoProcessor GPU 下采样（见 src/capture.rs）
+windows = { version = "0.62", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Gdi",
+    "Win32_Graphics_Dxgi",
+    "Win32_Graphics_Dxgi_Common",
+    "Win32_Graphics_Direct3D",
+    "Win32_Graphics_Direct3D11",
+    "Win32_System_WinRT_Direct3D11",
+    "Win32_System_WinRT_Graphics_Capture",
+    "Win32_System_Threading",
+    "Win32_System_DataExchange",
+    "Win32_System_Memory",
+    "Win32_System_Ole",
+    "Win32_System_LibraryLoader",
+    "Win32_System_StationsAndDesktops",
+    "Win32_System_RemoteDesktop",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_WindowsAndMessaging",
+    "Graphics_Capture",
+    "Graphics_DirectX",
+    "Graphics_DirectX_Direct3D11",
+    "Foundation",
+] }
+
+# === 核心：H.264 编码 ===
+# openh264 是 openh264-sys2 的安全封装（思科 OpenH264，BSD 许可），从源码编译无 DLL 依赖
+openh264 = "0.8"
+
+# === 核心：WebRTC ===
+# webrtc-rs 是纯 Rust WebRTC 实现，4.9k stars
+webrtc = "0.11"
+
+# === 核心：音频（跨平台采集/播放，走独立 DataChannel） ===
+# cpal：Rust 跨平台音频 I/O（Windows/WASAPI、macOS/CoreAudio、Linux/ALSA）
+cpal = "0.15"
+
+# === 核心：输入注入 ===
+# enigo 跨平台键鼠模拟，我们暂时 MVP 只做"被控端不注入，主控端不需要"
+# 后面 MVP 完了再加
+# enigo = "0.6"

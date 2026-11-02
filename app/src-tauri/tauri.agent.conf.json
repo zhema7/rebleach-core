@@ -1,0 +1,33 @@
+{
+  "productName": "Rebleach Agent",
+  "identifier": "com.rebleach.agent",
+  "build": {
+    "frontendDist": "../ui-agent"
+  },
+  "app": {
+    "withGlobalTauri": true,
+    "windows": []
+  },
+  "bundle": {
+    "shortDescription": "Rebleach 被控端",
+    "longDescription": "Rebleach 被控端：常驻托盘，接受主控端远程控制，支持中转与局域网直连。",
+    "resources": ["resources/virtual-display/**/*", "resources/rebleach-uiaaccess.cer"],
+    "externalBin": ["rebleach-ui"],
+    "windows": {
+      "nsis": {
+        "installMode": "perMachine",
+        "installerHooks": "./nsis/agent-hooks.nsh",
+        "languages": ["SimpChinese"],
+        "displayLanguageSelector": false
+      }
+    }
+  },
+  "plugins": {
+    "updater": {
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IEFENzg5QTA4OTUxQzkzQTMKUldTamt4eVZDSnA0clRydUNTdllCQXhUQWc2RzJqSHNZYmlGWlluL0lnRnFyUmNZM2NFQ2JKbEkK",
+      "endpoints": ["https://updates.example.com/api/v1/updater/download/updater-manifest-agent.json"],
+      "dangerousInsecureTransportProtocol": true,
+      "windows": { "installMode": "passive" }
+    }
+  }
+}

@@ -1,0 +1,27 @@
+# 构建产物
+/target/
+/dist/
+/packages/
+**/*.sig
+
+# 开发期日志 / 测试数据
+logs_*.txt
+*.log
+*.h264
+*.db
+
+# 本地配置与密钥（禁止提交）
+.env
+.env.*
+*.key
+*.pem
+*.pfx
+*.p12
+*.jks
+
+# 第三方虚拟显示驱动二进制：仓库只保留安装脚本，
+# 需要时自行获取 usbmmidd 后放入该目录（详见 app/src-tauri/resources/virtual-display/README.md）
+app/src-tauri/resources/virtual-display/*.inf
+app/src-tauri/resources/virtual-display/*.cat
+app/src-tauri/resources/virtual-display/*.dll
+app/src-tauri/resources/virtual-display/x64/

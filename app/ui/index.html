@@ -1,0 +1,153 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Rebleach 主控端</title>
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <!-- 连接页 -->
+  <main id="connect-view" class="center">
+    <div class="home-grid">
+      <section class="card">
+        <h1>Rebleach</h1>
+        <p class="sub">主控端 · 远程桌面控制</p>
+
+        <form id="connect-form" autocomplete="off">
+          <label>
+            <span>中转节点</span>
+            <select id="node-select"></select>
+          </label>
+
+          <label>
+            <span>本机主控 ID</span>
+            <div class="id-row">
+              <input id="device-id" class="mono" readonly />
+              <button id="copy-id" type="button" class="tb-btn">复制</button>
+            </div>
+          </label>
+
+          <label>
+            <span>对端设备 ID（被控端）</span>
+            <input id="peer" placeholder="输入被控端 ID 即可连接" spellcheck="false" />
+          </label>
+
+          <details id="adv">
+            <summary>高级选项</summary>
+            <label>
+              <span>帧率</span>
+              <input id="fps" type="number" value="30" min="1" max="60" />
+            </label>
+            <label>
+              <span>STUN/TURN（可选，逗号分隔）</span>
+              <input id="ice" placeholder="默认内置；一般无需填写" spellcheck="false" />
+            </label>
+          </details>
+
+          <button id="connect-btn" type="submit">连接</button>
+          <p id="connect-error" class="error"></p>
+        </form>
+      </section>
+
+      <section class="card">
+        <h2>局域网直连</h2>
+        <p class="sub">同一局域网内免授权直连（验证码在被控端托盘图标上查看）</p>
+
+        <form id="lan-form" autocomplete="off">
+          <label>
+            <span>被控端 IP</span>
+            <input id="lan-ip" placeholder="如 192.168.1.20" spellcheck="false" />
+          </label>
+          <label>
+            <span>验证码（6 位）</span>
+            <input id="lan-pin" placeholder="被控端托盘提示中的验证码" spellcheck="false" maxlength="6" />
+          </label>
+          <div class="id-row">
+            <button id="lan-connect-btn" type="submit">局域网连接</button>
+            <button id="lan-scan-btn" type="button" class="tb-btn">搜索设备</button>
+          </div>
+          <p id="lan-error" class="error"></p>
+        </form>
+        <ul id="lan-list" class="lan-list"></ul>
+      </section>
+
+      <section class="card">
+        <h2>中转节点管理</h2>
+        <p class="sub">默认节点内置；可自行添加新节点并切换使用</p>
+        <ul id="node-list" class="lan-list"></ul>
+        <form id="node-form" autocomplete="off">
+          <label>
+            <span>节点名称</span>
+            <input id="node-name" placeholder="如：上海节点" spellcheck="false" />
+          </label>
+          <label>
+            <span>节点地址</span>
+            <input id="node-url" placeholder="wss://host/ws" spellcheck="false" />
+          </label>
+          <button id="node-add-btn" type="submit" class="tb-btn">添加节点</button>
+          <p id="node-error" class="error"></p>
+        </form>
+      </section>
+    </div>
+  </main>
+
+  <!-- 会话页 -->
+  <section id="session-view" hidden>
+    <div id="toolbar" hidden>
+      <label class="tb-field">
+        <span>显示器</span>
+        <select id="monitor-select" disabled>
+          <option value="-1">等待清单…</option>
+        </select>
+      </label>
+      <label class="tb-field">
+        <span>画质</span>
+        <select id="quality-select">
+          <option value="balanced">均衡</option>
+          <option value="low">流畅（低带宽）</option>
+          <option value="high">高清</option>
+          <option value="custom">自定义码率…</option>
+        </select>
+      </label>
+      <label class="tb-field">
+        <span>分辨率</span>
+        <select id="res-select">
+          <option value="">不修改</option>
+          <option value="1920x1080">1920×1080</option>
+          <option value="1600x900">1600×900</option>
+          <option value="1366x768">1366×768</option>
+          <option value="1280x720">1280×720</option>
+          <option value="2560x1440">2560×1440</option>
+          <option value="0x0">恢复原始</option>
+        </select>
+      </label>
+      <button id="refresh-btn" type="button" class="tb-btn">刷新画面</button>
+      <button id="add-virtual-btn" type="button" class="tb-btn">+ 虚拟屏</button>
+      <button id="remove-virtual-btn" type="button" class="tb-btn">删虚拟屏</button>
+      <button id="clip-btn" type="button" class="tb-btn on">剪贴板</button>
+      <button id="shot-btn" type="button" class="tb-btn">截图</button>
+      <button id="lock-btn" type="button" class="tb-btn">锁定</button>
+      <button id="unlock-btn" type="button" class="tb-btn">解锁</button>
+      <button id="restart-btn" type="button" class="tb-btn danger">重启</button>
+      <button id="fullscreen-btn" type="button" class="tb-btn">全屏</button>
+      <button id="file-btn" type="button" class="tb-btn">发送文件</button>
+      <input id="file-input" type="file" hidden />
+      <span id="file-status"></span>
+      <button id="update-btn" type="button" class="tb-btn" hidden>有新版本</button>
+    </div>
+    <div id="stage">
+      <canvas id="screen" tabindex="0"></canvas>
+      <p id="hint">等待画面…</p>
+    </div>
+    <footer id="statusbar">
+      <span id="status-text">连接中…</span>
+      <span id="netstats"></span>
+      <span id="stats"></span>
+      <button id="disconnect-btn" type="button">断开</button>
+    </footer>
+  </section>
+
+  <script src="app.js"></script>
+</body>
+</html>

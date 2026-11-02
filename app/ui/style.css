@@ -1,0 +1,344 @@
+:root {
+  --bg: #0b1220;
+  --bg-soft: #111c2e;
+  --card: #16233a;
+  --line: #24344f;
+  --text: #e6edf7;
+  --muted: #8ea0ba;
+  --accent: #4c9aff;
+  --accent-strong: #2f7de1;
+  --danger: #ff6b6b;
+}
+
+* { box-sizing: border-box; }
+
+/* 修复 .center / #session-view 的 display:flex 覆盖浏览器内置 [hidden] 的问题
+   症状：进入会话后连接页三张卡片仍显示在顶部 */
+[hidden] { display: none !important; }
+
+html, body {
+  margin: 0;
+  height: 100%;
+  background: var(--bg);
+  color: var(--text);
+  font-family: "Segoe UI", "Microsoft YaHei UI", system-ui, sans-serif;
+  font-size: 14px;
+  overflow: hidden;
+  user-select: none;
+}
+
+.center {
+  height: 100vh;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background:
+    radial-gradient(1200px 700px at 50% -10%, #1b2f4d 0%, transparent 60%),
+    var(--bg);
+}
+
+.card {
+  width: 400px;
+  padding: 30px 32px 24px;
+  background: var(--card);
+  border: 1px solid var(--line);
+  border-radius: 14px;
+  box-shadow: 0 24px 60px rgba(0, 0, 0, 0.45);
+}
+
+.card h1 {
+  margin: 0;
+  font-size: 26px;
+  letter-spacing: 0.5px;
+}
+
+.card .sub {
+  margin: 6px 0 22px;
+  color: var(--muted);
+  font-size: 12.5px;
+}
+
+form label {
+  display: block;
+  margin-bottom: 14px;
+}
+
+form label span {
+  display: block;
+  margin-bottom: 6px;
+  color: var(--muted);
+  font-size: 12.5px;
+}
+
+input, select {
+  width: 100%;
+  height: 36px;
+  padding: 0 10px;
+  color: var(--text);
+  background: var(--bg-soft);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  font-size: 13.5px;
+  outline: none;
+}
+
+input:focus, select:focus {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 2px rgba(76, 154, 255, 0.18);
+}
+
+button {
+  width: 100%;
+  height: 38px;
+  margin-top: 6px;
+  color: #fff;
+  background: var(--accent-strong);
+  border: none;
+  border-radius: 8px;
+  font-size: 14px;
+  cursor: pointer;
+}
+
+button:hover { background: var(--accent); }
+button:disabled { opacity: 0.55; cursor: default; }
+
+.error {
+  min-height: 18px;
+  margin: 10px 0 0;
+  color: var(--danger);
+  font-size: 12.5px;
+}
+
+/* ============ 主页面 ============ */
+.home-grid {
+  display: flex;
+  gap: 20px;
+  align-items: stretch;
+  max-width: 880px;
+  width: calc(100% - 48px);
+}
+
+.home-grid .card { flex: 1; width: auto; min-width: 340px; }
+
+.agent-card h2 {
+  margin: 0;
+  font-size: 20px;
+}
+
+.agent-card label {
+  display: block;
+  margin-bottom: 14px;
+}
+
+.agent-card label > span {
+  display: block;
+  margin-bottom: 6px;
+  color: var(--muted);
+  font-size: 12.5px;
+}
+
+.id-row {
+  display: flex;
+  gap: 8px;
+}
+
+.id-row input { flex: 1; min-width: 0; }
+
+.id-row .tb-btn {
+  width: auto;
+  height: 36px;
+  margin: 0;
+  flex: none;
+  background: transparent;
+}
+
+.agent-card .switch {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  color: var(--text);
+  font-size: 12.5px;
+  cursor: pointer;
+}
+
+.agent-card .switch input {
+  width: 16px;
+  height: 16px;
+  flex: none;
+  accent-color: var(--accent);
+}
+
+.agent-status { color: var(--accent); }
+
+.muted { color: var(--muted); }
+.small { font-size: 12px; }
+
+details {
+  margin-bottom: 14px;
+  color: var(--muted);
+  font-size: 12.5px;
+}
+
+details summary {
+  cursor: pointer;
+  margin-bottom: 10px;
+}
+
+/* ============ 会话页 ============ */
+#session-view {
+  height: 100vh;
+  display: flex;
+  flex-direction: column;
+}
+
+#stage {
+  position: relative;
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: #000;
+}
+
+#screen {
+  max-width: 100%;
+  max-height: 100%;
+  display: block;
+  outline: none;
+  cursor: default;
+}
+
+#hint {
+  position: absolute;
+  margin: 0;
+  color: var(--muted);
+  font-size: 14px;
+  pointer-events: none;
+}
+
+#statusbar {
+  height: 44px;
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  padding: 0 16px;
+  background: var(--bg-soft);
+  border-top: 1px solid var(--line);
+}
+
+#status-text {
+  flex: 1;
+  color: var(--muted);
+  font-size: 12.5px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+#stats {
+  color: var(--muted);
+  font-size: 12.5px;
+  font-variant-numeric: tabular-nums;
+}
+
+#netstats {
+  color: var(--muted);
+  font-size: 12.5px;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+/* ============ 会话工具栏 ============ */
+#toolbar {
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 12px;
+  background: var(--bg-soft);
+  border-bottom: 1px solid var(--line);
+  overflow-x: auto;
+  scrollbar-width: thin;
+}
+
+#toolbar[hidden] { display: none; }
+
+.tb-field {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  color: var(--muted);
+  font-size: 12.5px;
+  white-space: nowrap;
+}
+
+.tb-field select,
+.tb-field input {
+  height: 28px;
+  font-size: 12.5px;
+  border-radius: 6px;
+}
+
+#monitor-select { width: 190px; }
+#quality-select { width: 130px; }
+#res-select { width: 122px; }
+
+.tb-btn {
+  width: auto;
+  height: 28px;
+  margin: 0;
+  padding: 0 12px;
+  background: transparent;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  color: var(--text);
+  font-size: 12.5px;
+  white-space: nowrap;
+}
+
+.tb-btn:hover { border-color: var(--accent); background: transparent; }
+.tb-btn:disabled { opacity: 0.5; }
+
+.tb-btn.on { border-color: #2fbf71; color: #8fe9b5; }
+.tb-btn.danger:hover { border-color: var(--danger); color: var(--danger); }
+
+.tb-text {
+  flex: 1;
+  min-width: 0;
+}
+
+.tb-text input { flex: 1; min-width: 0; }
+
+#file-status {
+  color: var(--accent);
+  font-size: 12px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 220px;
+}
+
+#disconnect-btn {
+  width: auto;
+  height: 28px;
+  margin: 0;
+  padding: 0 16px;
+  background: transparent;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  font-size: 12.5px;
+}
+
+#disconnect-btn:hover {
+  border-color: var(--danger);
+  color: var(--danger);
+  background: transparent;
+}
+
+/* 局域网设备 / 节点列表 */
+.lan-list { list-style: none; margin: 8px 0; padding: 0; }
+.lan-list li { display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 4px 0; font-size: 13px; }
+.lan-item { cursor: pointer; color: #7ab8ff; }
+.lan-item:hover { text-decoration: underline; }

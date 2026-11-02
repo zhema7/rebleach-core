@@ -1,0 +1,15 @@
+[package]
+name = "rebleach-ui-shim"
+version.workspace = true
+edition = "2021"
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "rebleach-ui"
+path = "src/main.rs"
+
+[dependencies]
+
+[build-dependencies]
+embed-manifest = "1"

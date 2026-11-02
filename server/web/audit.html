@@ -1,0 +1,70 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>审计日志 · Rebleach 管理端</title>
+<style>
+:root{--bg:#0f1420;--panel:#171e2e;--line:#263050;--fg:#dbe4ff;--dim:#8b98b8;--acc:#4f7cff;--ok:#2fbf71;--warn:#e0a63e;--bad:#e5534b}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--fg);font:14px/1.6 "Segoe UI",system-ui,sans-serif}
+nav{display:flex;gap:4px;padding:10px 20px;background:var(--panel);border-bottom:1px solid var(--line);align-items:center;flex-wrap:wrap}
+nav .brand{font-weight:700;margin-right:18px;color:var(--acc)}
+nav a{color:var(--dim);text-decoration:none;padding:6px 12px;border-radius:8px}
+nav a.active,nav a:hover{color:var(--fg);background:#1f2940}
+main{padding:22px;max-width:1100px;margin:0 auto}
+h1{font-size:18px;margin:0 0 14px}
+table{width:100%;border-collapse:collapse;background:var(--panel);border:1px solid var(--line);border-radius:10px;overflow:hidden}
+th,td{padding:9px 12px;text-align:left;border-bottom:1px solid var(--line);font-size:13px}
+th{color:var(--dim);font-weight:600;background:#141b2b}
+tr:last-child td{border-bottom:none}
+.badge{display:inline-block;padding:2px 9px;border-radius:99px;font-size:12px;background:rgba(79,124,255,.12);color:var(--acc)}
+.b-warn{background:rgba(229,83,75,.15);color:var(--bad)}
+.b-ok{background:rgba(47,191,113,.15);color:var(--ok)}
+.muted{color:var(--dim)}
+.mono{font-family:Consolas,monospace;font-size:12px}
+.err{color:var(--bad)}
+</style>
+</head>
+<body>
+<nav>
+  <span class="brand">Rebleach 管理端</span>
+  <a href="/admin/devices">设备列表</a>
+  <a href="/admin/grants">授权管理</a>
+  <a href="/admin/packages">出包中心</a>
+  <a href="/admin/audit" class="active">审计日志</a>
+</nav>
+<main>
+  <h1>审计日志 <span class="muted" id="cnt"></span></h1>
+  <table>
+    <thead><tr>
+      <th>时间</th><th>事件</th><th>发起方</th><th>对端</th><th>详情</th>
+    </tr></thead>
+    <tbody id="rows"></tbody>
+  </table>
+  <p class="muted">每 5 秒自动刷新，最多展示最近 500 条。</p>
+</main>
+<script>
+const esc=s=>String(s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const fmt=t=>t?new Date(t*1000).toLocaleString():'-';
+const BAD=new Set(['connect_blocked','sdp_blocked','register_conflict','grant_revoke','grant_expire','session_end']);
+const OK=new Set(['connect','grant_create','register']);
+async function j(u){const r=await fetch(u);if(!r.ok)throw new Error(r.status);return r.json()}
+async function load(){
+  try{
+    const d=(await j('/api/v1/audit?limit=500')).data;
+    document.getElementById('cnt').textContent='（最近 '+d.length+' 条）';
+    document.getElementById('rows').innerHTML=d.map(x=>{
+      const cls=BAD.has(x.event)?'badge b-warn':OK.has(x.event)?'badge b-ok':'badge';
+      return '<tr><td class="muted">'+fmt(x.ts)+'</td>'+
+        '<td><span class="'+cls+'">'+esc(x.event)+'</span></td>'+
+        '<td class="mono">'+esc(x.actor)+'</td>'+
+        '<td class="mono">'+esc(x.peer)+'</td>'+
+        '<td class="muted">'+esc(x.detail)+'</td></tr>';
+    }).join('')||'<tr><td colspan="5" class="muted">暂无审计记录</td></tr>';
+  }catch(e){document.getElementById('rows').innerHTML='<tr><td colspan="5" class="err">加载失败：'+esc(e.message)+'</td></tr>'}
+}
+load();setInterval(load,5000);
+</script>
+</body>
+</html>

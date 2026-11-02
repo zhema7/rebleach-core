@@ -1,0 +1,95 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>设备列表 · Rebleach 管理端</title>
+<style>
+:root{--bg:#0f1420;--panel:#171e2e;--line:#263050;--fg:#dbe4ff;--dim:#8b98b8;--acc:#4f7cff;--ok:#2fbf71;--warn:#e0a63e;--bad:#e5534b}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--fg);font:14px/1.6 "Segoe UI",system-ui,sans-serif}
+nav{display:flex;gap:4px;padding:10px 20px;background:var(--panel);border-bottom:1px solid var(--line);align-items:center;flex-wrap:wrap}
+nav .brand{font-weight:700;margin-right:18px;color:var(--acc)}
+nav a{color:var(--dim);text-decoration:none;padding:6px 12px;border-radius:8px}
+nav a.active,nav a:hover{color:var(--fg);background:#1f2940}
+main{padding:22px;max-width:1400px;margin:0 auto}
+h1{font-size:18px;margin:0 0 14px}
+table{width:100%;border-collapse:collapse;background:var(--panel);border:1px solid var(--line);border-radius:10px;overflow:hidden}
+th,td{padding:9px 12px;text-align:left;border-bottom:1px solid var(--line);font-size:13px;white-space:nowrap}
+th{color:var(--dim);font-weight:600;background:#141b2b}
+tr:last-child td{border-bottom:none}
+.badge{display:inline-block;padding:2px 9px;border-radius:99px;font-size:12px}
+.b-on{background:rgba(47,191,113,.15);color:var(--ok)}
+.b-busy{background:rgba(224,166,62,.15);color:var(--warn)}
+.b-off{background:rgba(139,152,184,.15);color:var(--dim)}
+.muted{color:var(--dim)}
+.mono{font-family:Consolas,monospace;font-size:12px}
+.err{color:var(--bad)}
+button{background:#1f2940;color:var(--fg);border:1px solid var(--line);border-radius:7px;padding:4px 10px;cursor:pointer;font-size:12px}
+button:hover{background:#27324d}
+button.acc{border-color:var(--acc);color:#a8c1ff}
+</style>
+</head>
+<body>
+<nav>
+  <span class="brand">Rebleach 管理端</span>
+  <a href="/admin/devices" class="active">设备列表</a>
+  <a href="/admin/grants">授权管理</a>
+  <a href="/admin/packages">出包中心</a>
+  <a href="/admin/audit">审计日志</a>
+</nav>
+<main>
+  <h1>设备列表 <span class="muted" id="cnt"></span></h1>
+  <table>
+    <thead><tr>
+      <th>设备 ID</th><th>角色</th><th>状态</th><th>主机名</th><th>设备型号</th><th>系统</th>
+      <th>CPU</th><th>内存</th><th>存储</th><th>IP</th><th>地区</th><th>最近在线</th><th>操作</th>
+    </tr></thead>
+    <tbody id="rows"></tbody>
+  </table>
+  <p class="muted">每 5 秒自动刷新。「开放 24h」= 允许任意主控端在 24 小时内输入该设备 ID 直接连接（授权管理页可撤销）。</p>
+</main>
+<script>
+const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const fmt=t=>t?new Date(t*1000).toLocaleString():'-';
+const gb=n=>n>0?(n>=1024?(n/1024).toFixed(0)+' TB':n+' GB'):'-';
+const mem=n=>n>0?(n>=1024?(n/1024).toFixed(1)+' GB':n+' MB'):'-';
+async function j(u,opt){const r=await fetch(u,opt);if(!r.ok)throw new Error(r.status);return r.json()}
+async function allow(id){
+  if(!confirm('允许任意主控端在 24 小时内连接设备 '+id+' ？'))return;
+  try{
+    const r=await fetch('/api/v1/grants',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({controller_id:'*',controlled_id:id,duration_secs:86400,note:'一键开放（管理端）'})});
+    const d=await r.json();
+    if(!d.ok)throw new Error(d.error||'失败');
+    alert('已开放连接权限，主控端输入设备 ID 即可连接（24 小时）。');
+    load();
+  }catch(e){alert('操作失败：'+e.message)}
+}
+async function load(){
+  try{
+    const d=(await j('/api/v1/devices')).data;
+    document.getElementById('cnt').textContent='（共 '+d.length+' 台）';
+    document.getElementById('rows').innerHTML=d.map(x=>{
+      const st=x.online?(x.busy?'<span class="badge b-busy">连接中</span>':'<span class="badge b-on">在线</span>'):'<span class="badge b-off">离线</span>';
+      const op=x.role==='controlled'?'<button class="acc" onclick="location.href=\'/admin/grants\'">去授权</button>':'-';
+      return '<tr><td class="mono">'+esc(x.id)+'</td>'+
+      '<td>'+(x.role==='controller'?'主控端':'被控端')+'</td>'+
+      '<td>'+st+'</td>'+
+      '<td>'+(esc(x.hostname)||'-')+'</td>'+
+      '<td>'+(esc(x.model)||'-')+'</td>'+
+      '<td>'+(esc(x.os)||'-')+'</td>'+
+      '<td>'+(esc(x.cpu)||'-')+'</td>'+
+      '<td>'+mem(x.memory_mb)+'</td>'+
+      '<td>'+gb(x.storage_gb)+'</td>'+
+      '<td class="mono">'+(esc(x.ip)||'-')+'</td>'+
+      '<td>'+(esc(x.region)||'-')+'</td>'+
+      '<td class="muted">'+fmt(x.last_seen)+'</td>'+
+      '<td>'+op+'</td></tr>';
+    }).join('')||'<tr><td colspan="13" class="muted">暂无设备注册</td></tr>';
+  }catch(e){document.getElementById('rows').innerHTML='<tr><td colspan="13" class="err">加载失败：'+esc(e.message)+'</td></tr>'}
+}
+load();setInterval(load,5000);
+</script>
+</body>
+</html>

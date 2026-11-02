@@ -1,0 +1,193 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>授权管理 · Rebleach 管理端</title>
+<style>
+:root{--bg:#0f1420;--panel:#171e2e;--line:#263050;--fg:#dbe4ff;--dim:#8b98b8;--acc:#4f7cff;--ok:#2fbf71;--warn:#e0a63e;--bad:#e5534b}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--fg);font:14px/1.6 "Segoe UI",system-ui,sans-serif}
+nav{display:flex;gap:4px;padding:10px 20px;background:var(--panel);border-bottom:1px solid var(--line);align-items:center;flex-wrap:wrap}
+nav .brand{font-weight:700;margin-right:18px;color:var(--acc)}
+nav a{color:var(--dim);text-decoration:none;padding:6px 12px;border-radius:8px}
+nav a.active,nav a:hover{color:var(--fg);background:#1f2940}
+main{padding:22px;max-width:1200px;margin:0 auto}
+h1{font-size:18px;margin:0 0 14px}
+h2{font-size:15px;margin:0 0 10px;color:var(--dim)}
+table{width:100%;border-collapse:collapse;background:var(--panel);border:1px solid var(--line);border-radius:10px;overflow:hidden;margin-bottom:18px}
+th,td{padding:9px 12px;text-align:left;border-bottom:1px solid var(--line);font-size:13px}
+th{color:var(--dim);font-weight:600;background:#141b2b}
+tr:last-child td{border-bottom:none}
+.badge{display:inline-block;padding:2px 9px;border-radius:99px;font-size:12px}
+.b-act{background:rgba(47,191,113,.15);color:var(--ok)}
+.b-exp{background:rgba(139,152,184,.15);color:var(--dim)}
+.b-rev{background:rgba(229,83,75,.15);color:var(--bad)}
+.b-pen{background:rgba(224,166,62,.15);color:var(--warn)}
+.b-ele{background:rgba(79,124,255,.15);color:#8fb3ff}
+button{background:var(--acc);color:#fff;border:0;border-radius:8px;padding:7px 14px;cursor:pointer;font-size:13px}
+button:hover{background:#3a65e0}
+button.danger{background:var(--bad);padding:4px 10px;font-size:12px}
+button.danger:hover{background:#c93d35}
+button.sec{background:#5a5f73;padding:4px 10px;font-size:12px}
+button.sec:hover{background:#6d7389}
+input,select{background:#101728;border:1px solid var(--line);color:var(--fg);border-radius:8px;padding:7px 10px;font-size:13px;width:100%}
+.card{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:16px;margin-bottom:18px}
+.grid{display:grid;gap:10px;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));align-items:end}
+label{font-size:12px;color:var(--dim);display:block;margin-bottom:4px}
+.muted{color:var(--dim)}
+.mono{font-family:Consolas,monospace;font-size:12px}
+.err{color:var(--bad)}
+.okmsg{color:var(--ok)}
+details summary{cursor:pointer;color:var(--dim);font-size:12.5px}
+details p{margin:6px 0 0;font-size:12px;color:var(--dim)}
+</style>
+</head>
+<body>
+<nav>
+  <span class="brand">Rebleach 管理端</span>
+  <a href="/admin/devices">设备列表</a>
+  <a href="/admin/grants" class="active">授权管理</a>
+  <a href="/admin/packages">出包中心</a>
+  <a href="/admin/audit">审计日志</a>
+</nav>
+<main>
+  <h1>授权管理（一对一精确授权）</h1>
+  <p class="muted" style="margin-bottom:14px">为某台主控端和某台被控端指定一段连接时长；到期或撤销后双方自动断开。被控端必须已在设备列表注册。</p>
+
+  <div class="card">
+    <div class="grid">
+      <div><label>主控端设备 ID</label><input id="cid" placeholder="9 位数字"></div>
+      <div><label>被控端设备 ID</label><input id="tid" placeholder="9 位数字"></div>
+      <div>
+        <label>时长</label>
+        <select id="duration">
+          <option value="1h">1 小时</option>
+          <option value="2h">2 小时</option>
+          <option value="4h">4 小时</option>
+          <option value="12h">12 小时</option>
+          <option value="1d" selected>1 天</option>
+          <option value="3d">3 天</option>
+          <option value="7d">7 天</option>
+          <option value="30d">30 天</option>
+          <option value="90d">90 天</option>
+          <option value="180d">180 天</option>
+          <option value="1m">30 天（月）</option>
+          <option value="3m">3 × 30 天</option>
+          <option value="6m">6 × 30 天</option>
+          <option value="12m">12 × 30 天</option>
+        </select>
+      </div>
+      <div><label>备注（可选）</label><input id="note" placeholder="用途 / 申请人"></div>
+      <div><button id="create">创建授权</button></div>
+    </div>
+    <div id="msg" style="margin-top:8px"></div>
+  </div>
+
+  <div class="card">
+    <h2>紧急控制（被控端已在线时立即生效）</h2>
+    <p class="muted" style="margin-bottom:12px">当标准键鼠/屏幕通道因任何原因失效时，管理端可直接对被控端下发紧急指令，绕过被控端状态层。</p>
+    <div class="grid" style="grid-template-columns:repeat(auto-fit,minmax(200px,1fr))">
+      <div><label>被控端设备 ID</label><input id="emergency-id" placeholder="9 位数字"></div>
+      <div>
+        <label>紧急动作</label>
+        <select id="emergency-action">
+          <option value="restart">重启被控端电脑</option>
+          <option value="shutdown">关机</option>
+          <option value="unlock">解锁被控端桌面</option>
+          <option value="reload">被控端刷新自身（重建采集/编码/信令）</option>
+          <option value="disconnect">踢掉所有主控端连接</option>
+        </select>
+      </div>
+      <div style="display:flex;align-items:end"><button id="emergency-btn" class="danger">立即下发</button></div>
+    </div>
+    <div id="emergency-msg" style="margin-top:8px"></div>
+  </div>
+
+  <h2 style="margin-top:20px">授权记录</h2>
+  <table>
+    <thead><tr>
+      <th>#</th><th>主控端</th><th>被控端</th><th>开始</th><th>结束</th><th>剩余</th><th>状态</th><th>备注</th><th></th>
+    </tr></thead>
+    <tbody id="rows"></tbody>
+  </table>
+  <p class="muted">每 5 秒自动刷新。撤销或到期后服务端会主动断开双方会话。</p>
+</main>
+<script>
+const esc=s=>String(s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const fmt=t=>t?new Date(t*1000).toLocaleString():'-';
+const rem=s=>{
+  if(!s||s<=0)return'-';
+  const h=Math.floor(s/3600),m=Math.floor((s%3600)/60),d=Math.floor(h/24);
+  if(d>0)return d+'天'+(h%24?' '+(h%24)+'小时':'');
+  if(h>0)return h+'小时'+(m?' '+m+'分':'');
+  return m+'分';
+};
+const ST={active:['生效中','b-act'],expired:['已过期','b-exp'],revoked:['已撤销','b-rev'],pending:['未开始','b-pen']};
+const DURMAP={
+  '1h':['h',1],'2h':['h',2],'4h':['h',4],'12h':['h',12],
+  '1d':['d',1],'3d':['d',3],'7d':['d',7],'30d':['d',30],'90d':['d',90],'180d':['d',180],
+  '1m':['m',1],'3m':['m',3],'6m':['m',6],'12m':['m',12],
+};
+async function j(u,o){const r=await fetch(u,o);if(!r.ok)throw new Error(r.status+': '+await r.text());return r.json()}
+async function load(){
+  try{
+    const d=(await j('/api/v1/grants')).data;
+    document.getElementById('rows').innerHTML=d.map(x=>{
+      const st=ST[x.status]||[x.status,'b-exp'];
+      const btn=(x.status==='active'||x.status==='pending')
+        ?'<button class="danger" onclick="revoke('+x.id+')">撤销</button>':'';
+      return '<tr><td class="muted">'+x.id+'</td>'+
+        '<td class="mono">'+esc(x.controller_id)+'</td>'+
+        '<td class="mono">'+esc(x.controlled_id)+'</td>'+
+        '<td>'+fmt(x.start_at)+'</td><td>'+fmt(x.end_at)+'</td>'+
+        '<td class="muted">'+rem(x.end_at - Math.floor(Date.now()/1000))+'</td>'+
+        '<td><span class="badge '+st[1]+'">'+st[0]+'</span></td>'+
+        '<td>'+(esc(x.note)||'-')+'</td><td>'+btn+'</td></tr>';
+    }).join('')||'<tr><td colspan="9" class="muted">暂无授权记录</td></tr>';
+  }catch(e){document.getElementById('rows').innerHTML='<tr><td colspan="9" class="err">加载失败：'+esc(e.message)+'</td></tr>'}
+}
+async function revoke(id){
+  if(!confirm('确认撤销授权 #'+id+'？双方将立即断开。'))return;
+  await fetch('/api/v1/grants/'+id,{method:'DELETE'});
+  load();
+}
+document.getElementById('create').onclick=async()=>{
+  const msg=document.getElementById('msg');
+  msg.className='';msg.textContent='';
+  const cid=document.getElementById('cid').value.trim();
+  const tid=document.getElementById('tid').value.trim();
+  const dk=document.getElementById('duration').value;
+  const d=DURMAP[dk];
+  const note=document.getElementById('note').value.trim()||null;
+  if(!cid||!tid){msg.className='err';msg.textContent='请填写主控端与被控端设备 ID';return}
+  if(!d){msg.className='err';msg.textContent='请选择有效时长';return}
+  const body={controller_id:cid,controlled_id:tid,duration_unit:d[0],duration_value:d[1],note};
+  try{
+    const r=await j('/api/v1/grants',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+    msg.className='okmsg';msg.textContent='已创建授权 #'+r.id+'，'+fmt(r.start_at)+' → '+fmt(r.end_at);
+    load();
+  }catch(e){msg.className='err';msg.textContent='创建失败：'+e.message}
+};
+document.getElementById('emergency-btn').onclick=async()=>{
+  const msg=document.getElementById('emergency-msg');
+  msg.className='';msg.textContent='';
+  const id=document.getElementById('emergency-id').value.trim();
+  const act=document.getElementById('emergency-action').value;
+  if(!id){msg.className='err';msg.textContent='请填写被控端设备 ID';return}
+  const label=document.getElementById('emergency-action').selectedOptions[0].textContent;
+  if(!confirm('确定对 '+id+' 执行「'+label+'」？立即生效，不可撤销。'))return;
+  try{
+    const r=await j('/api/v1/devices/'+id+'/emergency',
+      {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action:act})});
+    if(r.ok){
+      msg.className='okmsg';msg.textContent='已下发紧急指令：'+label;
+    }else{
+      msg.className='err';msg.textContent='下发失败：'+(r.error||'未知错误');
+    }
+  }catch(e){msg.className='err';msg.textContent='请求失败：'+e.message}
+};
+load();setInterval(load,5000);
+</script>
+</body>
+</html>

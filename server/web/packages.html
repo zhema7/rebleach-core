@@ -1,0 +1,86 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>出包中心 · Rebleach 管理端</title>
+<style>
+:root{--bg:#0f1420;--panel:#171e2e;--line:#263050;--fg:#dbe4ff;--dim:#8b98b8;--acc:#4f7cff;--ok:#2fbf71;--bad:#e5534b}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--fg);font:14px/1.6 "Segoe UI",system-ui,sans-serif}
+nav{display:flex;gap:4px;padding:10px 20px;background:var(--panel);border-bottom:1px solid var(--line);align-items:center;flex-wrap:wrap}
+nav .brand{font-weight:700;margin-right:18px;color:var(--acc)}
+nav a{color:var(--dim);text-decoration:none;padding:6px 12px;border-radius:8px}
+nav a.active,nav a:hover{color:var(--fg);background:#1f2940}
+main{padding:22px;max-width:1100px;margin:0 auto}
+h1{font-size:18px;margin:0 0 14px}
+table{width:100%;border-collapse:collapse;background:var(--panel);border:1px solid var(--line);border-radius:10px;overflow:hidden}
+th,td{padding:9px 12px;text-align:left;border-bottom:1px solid var(--line);font-size:13px}
+th{color:var(--dim);font-weight:600;background:#141b2b}
+tr:last-child td{border-bottom:none}
+.muted{color:var(--dim)}
+.mono{font-family:Consolas,monospace;font-size:12px}
+.err{color:var(--bad)}
+a.dl{color:var(--acc);text-decoration:none}
+a.dl:hover{text-decoration:underline}
+.card{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:16px;margin-bottom:18px}
+code{background:#101728;border:1px solid var(--line);border-radius:6px;padding:2px 6px;font-size:12px}
+pre{background:#101728;border:1px solid var(--line);border-radius:8px;padding:12px;overflow:auto;font-size:12px}
+</style>
+</head>
+<body>
+<nav>
+  <span class="brand">Rebleach 管理端</span>
+  <a href="/admin/devices">设备列表</a>
+  <a href="/admin/grants">授权管理</a>
+  <a href="/admin/packages" class="active">出包中心</a>
+  <a href="/admin/audit">审计日志</a>
+</nav>
+<main>
+  <h1>出包中心</h1>
+
+  <div class="card">
+    <p class="muted" style="margin-top:0">
+      服务端启动目录下的 <code>packages/</code> 目录即出包中心仓库，把构建产物放进去即可在此分发。
+      点击文件名直接下载。
+    </p>
+    <details>
+      <summary class="muted" style="cursor:pointer">构建命令参考</summary>
+      <pre># 被控端 / 主控端 CLI
+cargo build --release -p rebleach-client
+copy target\release\rebleach-client.exe packages\
+
+# 主控端安装包（MSI / NSIS，需安装 cargo-tauri）
+cd app
+cargo tauri build
+copy src-tauri\target\release\bundle\msi\*.msi ..\packages\
+copy src-tauri\target\release\bundle\nsis\*.exe ..\packages\</pre>
+    </details>
+  </div>
+
+  <table>
+    <thead><tr><th>文件名</th><th>大小</th><th>更新时间</th><th></th></tr></thead>
+    <tbody id="rows"></tbody>
+  </table>
+  <p class="muted">每 10 秒自动刷新。</p>
+</main>
+<script>
+const esc=s=>String(s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const fmt=t=>t?new Date(t*1000).toLocaleString():'-';
+const fsize=n=>n>1048576?(n/1048576).toFixed(1)+' MB':n>1024?(n/1024).toFixed(1)+' KB':n+' B';
+async function j(u){const r=await fetch(u);if(!r.ok)throw new Error(r.status);return r.json()}
+async function load(){
+  try{
+    const d=(await j('/api/v1/packages')).data;
+    document.getElementById('rows').innerHTML=d.map(x=>
+      '<tr><td class="mono">'+esc(x.name)+'</td>'+
+      '<td>'+fsize(x.size)+'</td>'+
+      '<td>'+fmt(x.mtime)+'</td>'+
+      '<td><a class="dl" href="/api/v1/packages/'+encodeURIComponent(x.name)+'">下载</a></td></tr>'
+    ).join('')||'<tr><td colspan="4" class="muted">packages/ 目录为空，请先放入构建产物</td></tr>';
+  }catch(e){document.getElementById('rows').innerHTML='<tr><td colspan="4" class="err">加载失败：'+esc(e.message)+'</td></tr>'}
+}
+load();setInterval(load,10000);
+</script>
+</body>
+</html>

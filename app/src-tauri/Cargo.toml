@@ -1,0 +1,67 @@
+[package]
+name = "rebleach-app"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "rebleach"
+path = "src/main.rs"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[features]
+# 双安装包拆分：默认主控端（UI + 会话）；agent 为纯托盘被控端（无窗口）
+# 构建被控端：cargo tauri build --no-default-features --features agent --config src-tauri/tauri.agent.conf.json
+default = ["controller"]
+controller = []
+agent = []
+
+[dependencies]
+rebleach-client = { path = "../../client" }
+
+tauri = { version = "2", features = ["tray-icon"] }
+tauri-plugin-updater = "2"
+# 更新请求走 https 自建服务器（自签 CA），需要给插件的 reqwest 注入内置根证书
+# 同时避开 aws-lc-rs（Windows 需 cmake/nasm），统一用 ring
+reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"
+tokio = { version = "1", features = ["full"] }
+parking_lot = "0.12"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# 本地媒体通道：H.264 帧走 127.0.0.1 WebSocket 二进制，避免 Tauri IPC 的 JSON 序列化开销
+axum = { version = "0.8", features = ["ws"] }
+futures-util = "0.3"
+
+# 主控端剪贴板读写（被控端在 client 库内走 Win32 API）
+arboard = "3"
+
+# 被控端 Agent：设备信息采集（内存/存储/系统/CPU）与开机自启注册表
+sysinfo = "0.33"
+winreg = "0.56"
+base64 = "0.22"
+
+# 被控端 Windows 服务化：SCM 注册 + 服务控制分发（仅 agent feature 用到）
+windows-service = "0.8"
+
+# 服务会话监控：WTSGetActiveConsoleSessionId 判断用户是否已登录
+# 虚拟屏：PlugMonitor.ps1 插拔 + QueryDisplayConfig/SetDisplayConfig 自动排布
+windows = { version = "0.62", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_System_RemoteDesktop",
+    "Win32_System_Threading",
+    "Win32_System_Environment",
+    "Win32_System_Diagnostics_ToolHelp",
+    "Win32_Devices_DeviceAndDriverInstallation",
+    "Win32_Devices_Display",
+    "Win32_System_IO",
+    "Win32_Storage_FileSystem",
+] }
