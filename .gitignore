@@ -3,6 +3,17 @@
 /dist/
 /packages/
 **/*.sig
+**/*.apk
+*.aab
+
+# Android / Gradle 构建产物
+/android/.gradle/
+/android/.kotlin/
+/android/build/
+/android/app/build/
+/android/local.properties
+# cargo-ndk 交叉编译产物（由构建流程生成，不入库）
+/android/app/src/main/jniLibs/**/*.so
 
 # 开发期日志 / 测试数据
 logs_*.txt

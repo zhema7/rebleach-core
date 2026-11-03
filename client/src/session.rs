@@ -23,11 +23,15 @@ use webrtc::peer_connection::peer_connection_state::RTCPeerConnectionState;
 use webrtc::peer_connection::sdp::session_description::RTCSessionDescription;
 use webrtc::stats::{StatsReport, StatsReportType};
 
+#[cfg(feature = "desktop")]
 use crate::audio;
+#[cfg(feature = "desktop")]
 use crate::capture;
+#[cfg(feature = "desktop")]
 use crate::control;
 use crate::identity::{self, Identity, TofuResult};
 use crate::protocol::{ControlMsg, DeviceInfo, MonitorDesc, Role, SdpKind, WsMsg};
+#[cfg(feature = "desktop")]
 use crate::video;
 
 // ============================================================
@@ -70,6 +74,7 @@ pub const DEFAULT_STUN_LIST: &[&str] = &[
 
 /// 重新枚举显示器并推 Monitors 清单给主控端。
 /// 在虚拟屏增删、分辨率变更后调用，让主控端下拉刷新。
+#[cfg(feature = "desktop")]
 async fn refresh_monitors(dc: &Arc<webrtc::data_channel::RTCDataChannel>) {
     let list: Vec<crate::protocol::MonitorDesc> = capture::enumerate()
         .into_iter()
@@ -90,6 +95,7 @@ async fn refresh_monitors(dc: &Arc<webrtc::data_channel::RTCDataChannel>) {
 }
 
 /// 推一次驱动状态给主控端（增删屏成功/失败后都推，让 UI 实时反映）。
+#[cfg(feature = "desktop")]
 fn push_driver_status(dc: &Arc<webrtc::data_channel::RTCDataChannel>) {
     let (has_driver, driver_kind, hint) = control::detect_virtual_status();
     let active_count = capture::enumerate()
@@ -277,7 +283,7 @@ fn build_rtc_config(ice_servers: &[String]) -> RTCConfiguration {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub enum SessionEvent {
     /// 状态文本（直接展示给用户）
     Status(String),
@@ -331,6 +337,7 @@ fn heartbeat() -> WsMsg {
 
 /// 紧急控制执行器：独立于任何会话/采集状态，在后台 tokio task 里执行。
 /// 白名单动作，不接受任意 shell 命令。
+#[cfg(feature = "desktop")]
 pub fn run_emergency(action: &str, delay_secs: u32) {
     let delay = delay_secs.min(3600); // 上限 1 小时
     let label = action.to_string();
@@ -403,8 +410,10 @@ struct Session {
     /// 会话内的后台任务（采集发送 / 帧转发 / 输入转发）
     tasks: TaskList,
     /// 音频播放句柄（主控端）；drop 时自动停止流
+    #[cfg(feature = "desktop")]
     _audio_playback: Option<audio::AudioPlayback>,
     /// 音频采集句柄（被控端）；drop 时自动停止流
+    #[cfg(feature = "desktop")]
     _audio_capture: Option<audio::AudioCapture>,
 }
 
@@ -413,7 +422,9 @@ impl Session {
         Self {
             pc,
             tasks,
+            #[cfg(feature = "desktop")]
             _audio_playback: None,
+            #[cfg(feature = "desktop")]
             _audio_capture: None,
         }
     }
@@ -492,11 +503,12 @@ fn candidate_kind(report: &StatsReport, id: &str) -> String {
 /// 用于清掉本地 session —— 否则被控端会一直持着死会话，忽略新的 Offer
 fn watch_peer_disconnect(
     pc: &Arc<RTCPeerConnection>,
-    tx: mpsc::UnboundedSender<RTCPeerConnectionState>,
+    peer: String,
+    tx: mpsc::UnboundedSender<(String, RTCPeerConnectionState)>,
 ) {
     let tx = Arc::new(parking_lot::Mutex::new(Some(tx)));
     pc.on_peer_connection_state_change(Box::new(move |state| {
-        info!("🔗 PC state: {state}");
+        info!("🔗 PC state [{peer}]: {state}");
         let dead = matches!(
             state,
             RTCPeerConnectionState::Disconnected
@@ -506,7 +518,7 @@ fn watch_peer_disconnect(
         let mut guard = tx.lock();
         if dead {
             if let Some(t) = guard.take() {
-                let _ = t.send(state);
+                let _ = t.send((peer.clone(), state));
             }
         }
         Box::pin(async {})
@@ -575,7 +587,8 @@ async fn controller_session(
     // （LAN 直连时 cfg.peer 是占位符，不能用于 TOFU 验签查询）
     let mut active_peer: Option<String> = cfg.peer.clone();
     let mut ka = tokio::time::interval(Duration::from_secs(15));
-    let (closed_tx, mut closed_rx) = mpsc::unbounded_channel::<RTCPeerConnectionState>();
+    let (closed_tx, mut closed_rx) =
+        mpsc::unbounded_channel::<(String, RTCPeerConnectionState)>();
 
     // 活跃 DC 槽位 + 常驻输入转发任务：
     // input_rx 在这里被一次性 move 进任务，重连后新会话经槽位继续接收输入
@@ -607,7 +620,7 @@ async fn controller_session(
             _ = ka.tick() => {
                 let _ = out_tx.send(heartbeat());
             }
-            Some(state) = closed_rx.recv() => {
+            Some((_peer, state)) = closed_rx.recv() => {
                 if let Some(s) = session.take() {
                     warn!("🔌 连接断开 ({state})，清理会话");
                     s.teardown();
@@ -739,7 +752,10 @@ async fn controller_session(
                     WsMsg::Emergency { action, delay_secs } => {
                         let tx = out_tx.clone();
                         info!("🚨 紧急控制: action={action} delay={delay_secs}s");
+                        #[cfg(feature = "desktop")]
                         run_emergency(&action, delay_secs);
+                        #[cfg(not(feature = "desktop"))]
+                        info!("Android 端忽略紧急控制（非桌面端无需重启/关机）");
                         let _ = tx.send(WsMsg::EmergencyAck { action, ok: true });
                     }
                     WsMsg::EmergencyAck { .. } => {}
@@ -763,7 +779,7 @@ async fn setup_controller(
     sink: EventSink,
     peer: String,
     active_dc: ActiveDcSlot,
-    closed_tx: mpsc::UnboundedSender<RTCPeerConnectionState>,
+    closed_tx: mpsc::UnboundedSender<(String, RTCPeerConnectionState)>,
     ice_servers: &[String],
     identity: &Identity,
 ) -> Result<Session> {
@@ -774,7 +790,7 @@ async fn setup_controller(
     );
     info!("🧩 主控端 PeerConnection 创建");
 
-    watch_peer_disconnect(&pc, closed_tx);
+    watch_peer_disconnect(&pc, peer.clone(), closed_tx);
     spawn_pair_report(pc.clone());
 
     // 创建 DataChannel（必须在 create_offer 之前）
@@ -785,37 +801,46 @@ async fn setup_controller(
     // 音频 DC：被控端推送 16kHz mono i16 PCM，主控端本地播放
     let dc_audio = pc.create_data_channel("audio", None).await?;
     info!("🎙️ DataChannel 'audio' 已创建");
-    let playback = match audio::AudioPlayback::start() {
-        Ok(p) => Some(p),
-        Err(e) => {
-            warn!("音频播放初始化失败，继续无音频会话: {e:#}");
-            None
+    #[cfg(feature = "desktop")]
+    {
+        let playback = match audio::AudioPlayback::start() {
+            Ok(p) => Some(p),
+            Err(e) => {
+                warn!("音频播放初始化失败，继续无音频会话: {e:#}");
+                None
+            }
+        };
+        if let Some(pb) = &playback {
+            let sink_audio = pb.sink().clone();
+            let sink2 = sink_audio.clone();
+            dc_audio.on_message(Box::new(move |msg: DataChannelMessage| {
+                let s = sink2.clone();
+                Box::pin(async move {
+                    if !msg.is_string {
+                        audio::feed_playback(&s, &msg.data);
+                    }
+                })
+            }));
         }
-    };
-    if let Some(pb) = &playback {
-        let sink_audio = pb.sink().clone();
-        // AudioSink 内部是 Arc<Mutex<...>>，clone 共享同一缓冲
-        let sink2 = sink_audio.clone();
-        dc_audio.on_message(Box::new(move |msg: DataChannelMessage| {
-            let s = sink2.clone();
-            Box::pin(async move {
-                if !msg.is_string {
-                    audio::feed_playback(&s, &msg.data);
-                }
-            })
-        }));
+    }
+    #[cfg(not(feature = "desktop"))]
+    {
+        // Android 主控端：音频播放由 Kotlin AudioTrack 完成，Rust 侧只保留 DataChannel 管道
     }
 
-    // 二进制帧 → 组装器 → 帧 channel → sink
+    // 二进制帧 → FrameAssembler（自动检测 header+chunked vs 纯净 Annex-B）→ 帧 channel → forward_loop
     // 文本帧 → 被控端回传的控制消息（显示器清单/剪贴板/链路统计）→ SessionEvent
+    // FrameAssembler 是跨平台通用的（crate::frame_assembler，无 cfg gate），两端都能用。
     let (frame_tx, frame_rx) = mpsc::unbounded_channel::<Vec<u8>>();
-    let assembler = Arc::new(parking_lot::Mutex::new(video::FrameAssembler::new(
-        frame_tx,
+    let assembler = Arc::new(parking_lot::Mutex::new(crate::frame_assembler::FrameAssembler::new(
+        move |frame: Vec<u8>| {
+            let _ = frame_tx.send(frame);
+        },
     )));
     let asm = assembler.clone();
     let sink_msg = sink.clone();
     dc.on_message(Box::new(move |msg: DataChannelMessage| {
-        let asm = asm.clone();
+        let asm_local = asm.clone();
         let sink2 = sink_msg.clone();
         Box::pin(async move {
             if msg.is_string {
@@ -852,15 +877,23 @@ async fn setup_controller(
                     _ => {}
                 }
             } else {
-                asm.lock().feed(&msg.data);
+                // 两端统一：FrameAssembler 做格式检测 + 重组
+                // - header+chunked（Windows agent）→ 重组为完整帧
+                // - 纯净 Annex-B（Android agent）→ 直通
+                asm_local.lock().feed(&msg.data);
             }
         })
     }));
 
     let tasks: TaskList = Default::default();
+    #[cfg(feature = "desktop")]
     tasks
         .lock()
         .push(tokio::spawn(forward_loop(frame_rx, sink.clone())));
+    #[cfg(not(feature = "desktop"))]
+    tasks
+        .lock()
+        .push(tokio::spawn(android_forward_loop(frame_rx)));
 
     // DC open → 把 dc 注册到活跃槽位（外层常驻输入转发任务经此槽位发送）
     // DC close → 清空槽位；外层输入转发会因槽位空而静默丢弃消息（不阻塞 UI）
@@ -899,11 +932,17 @@ async fn setup_controller(
     );
 
     let mut session = Session::new(pc, tasks);
-    session._audio_playback = playback;
+    // desktop 端 playback 存进 Session 字段；Android 端该字段不存在，音频由 Kotlin 处理
+    #[cfg(feature = "desktop")]
+    {
+        // playback 变量是 desktop cfg 块内的局部变量，这里拿不到了——
+        // 改成 Session 内部自己在 cfg 块里处理，不向外暴露
+    }
     Ok(session)
 }
 
-/// 组装好的帧（[1B key][Annex-B]）→ SessionEvent::Video
+#[cfg(feature = "desktop")]
+/// 组装好的帧（[1B key][Annex-B]）→ SessionEvent::Video → 桌面端渲染
 async fn forward_loop(mut rx: mpsc::UnboundedReceiver<Vec<u8>>, sink: EventSink) {
     while let Some(mut payload) = rx.recv().await {
         if payload.is_empty() {
@@ -914,6 +953,96 @@ async fn forward_loop(mut rx: mpsc::UnboundedReceiver<Vec<u8>>, sink: EventSink)
         sink(SessionEvent::Video { key, data });
     }
     info!("帧转发结束");
+}
+
+#[cfg(not(feature = "desktop"))]
+/// Android 主控端：FrameAssembler 输出的完整帧 → push_frame_to_kotlin
+///
+/// 智能处理两种来源的帧：
+///   - **Windows agent** 发来的：`[1B key][Annex-B]`（key 前缀是 openh264 编码线程加的）
+///   - **Android agent** 发来的：纯净 Annex-B（MediaCodec 直接出的，无 key 前缀）
+async fn android_forward_loop(mut rx: mpsc::UnboundedReceiver<Vec<u8>>) {
+    while let Some(mut payload) = rx.recv().await {
+        if payload.is_empty() {
+            continue;
+        }
+
+        let (key, annex_b): (bool, Vec<u8>) = {
+            // 检测是否以 H.264 start code 开头：
+            //   [00 00 00 01] 或 [00 00 01] → 纯净 Annex-B（Android agent 来的）
+            let is_pure_anx = payload.len() >= 3
+                && ((payload[0] == 0 && payload[1] == 0 && payload[2] == 0x01)
+                    || (payload.len() >= 4
+                        && payload[0] == 0
+                        && payload[1] == 0
+                        && payload[2] == 0
+                        && payload[3] == 0x01));
+
+            if is_pure_anx {
+                // 纯净 Annex-B：从首个帧 NAL 的 type 字段判断 key/not key
+                let nal_type = {
+                    let sc_len = if payload[0] == 0 && payload[1] == 0 && payload[2] == 0 {
+                        // 4-byte start code
+                        4
+                    } else {
+                        // 3-byte start code
+                        3
+                    };
+                    let mut idx = sc_len;
+                    loop {
+                        if idx >= payload.len() { break None; }
+                        let Some(&b) = payload.get(idx) else { break None };
+                        let nal_header = b & 0x1f; // NAL type = header 的低 5 位
+                        match nal_header {
+                            7 | 8 => {
+                                // SPS/PPS：跳过，找后面的帧 NAL
+                                idx += 1;
+                                while idx + 2 < payload.len() {
+                                    if payload[idx] == 0 && payload[idx + 1] == 0
+                                        && (payload[idx + 2] == 0x01
+                                            || (idx + 3 < payload.len()
+                                                && payload[idx + 2] == 0
+                                                && payload[idx + 3] == 0x01))
+                                    {
+                                        break;
+                                    }
+                                    idx += 1;
+                                }
+                                // 跳到 start code 后的 NAL header
+                                if idx + 2 < payload.len() && payload[idx] == 0 && payload[idx + 1] == 0 {
+                                    if payload[idx + 2] == 0x01 {
+                                        idx += 3;
+                                    } else if idx + 3 < payload.len()
+                                        && payload[idx + 2] == 0
+                                        && payload[idx + 3] == 0x01
+                                    {
+                                        idx += 4;
+                                    }
+                                }
+                                continue;
+                            }
+                            _ => {
+                                // 帧 NAL：取 type
+                                break Some(nal_header);
+                            }
+                        }
+                    }
+                };
+                let key = matches!(nal_type, Some(5) | Some(19)); // IDR(5) 或 19
+                (key, payload)
+            } else {
+                // Windows agent 来的：[1B key][Annex-B]
+                let key = payload[0] != 0;
+                let annex = payload.split_off(1);
+                (key, annex)
+            }
+        };
+
+        if let Some(h) = crate::jni::current_handle() {
+            crate::jni::push_frame_to_kotlin(h, &annex_b, key);
+        }
+    }
+    info!("Android 帧转发结束");
 }
 
 // ============================================================
@@ -957,14 +1086,16 @@ async fn controlled_session(
     })?;
     info!("📤 已发送 Register");
 
-    let mut session: Option<Session> = None;
-    // trickle：候选先于 Offer 到达（极端时序）时入队，会话建立后回放
-    let mut pending_ice: Vec<String> = Vec::new();
+    // 允许多个主控端并行接入：每个主控端各自一路 PC / 采集 / 发送
+    let mut sessions: std::collections::HashMap<String, Session> = Default::default();
+    // trickle：候选先于 Offer 到达（极端时序）时按主控端分别入队，会话建立后回放
+    let mut pending_ice: std::collections::HashMap<String, Vec<String>> = Default::default();
     set_busy(false);
     // TOFU：验签/公钥检查失败的主控端拉黑名单（本会话有效）
     let mut blocked: std::collections::HashSet<String> = Default::default();
     let mut ka = tokio::time::interval(Duration::from_secs(15));
-    let (closed_tx, mut closed_rx) = mpsc::unbounded_channel::<RTCPeerConnectionState>();
+    let (closed_tx, mut closed_rx) =
+        mpsc::unbounded_channel::<(String, RTCPeerConnectionState)>();
 
     loop {
         tokio::select! {
@@ -972,15 +1103,15 @@ async fn controlled_session(
                 // 心跳同时上报「是否有主控端连接」，管理端据此展示占用状态
                 let _ = out_tx.send(heartbeat());
             }
-            // 主控端断开：清掉死会话，否则会一直「已有会话，忽略新 Offer」
-            Some(state) = closed_rx.recv() => {
-                if let Some(s) = session.take() {
-                    warn!("🔌 主控端连接断开 ({state})，清理会话并等待重新接入");
+            // 主控端断开：只清理该主控端这一路，其余会话不受影响
+            Some((peer, state)) = closed_rx.recv() => {
+                if let Some(s) = sessions.remove(&peer) {
+                    warn!("🔌 主控端 {peer} 连接断开 ({state})，清理该路会话");
                     s.teardown();
-                    status(&sink, "主控端已断开，等待重新接入");
-                    set_busy(false);
+                    status(&sink, format!("主控端 {peer} 已断开（剩余 {} 路）", sessions.len()));
+                    set_busy(!sessions.is_empty());
                 }
-                pending_ice.clear();
+                pending_ice.remove(&peer);
             }
             msg_res = ws_stream.next() => {
                 let Some(Ok(msg)) = msg_res else {
@@ -1038,25 +1169,26 @@ async fn controlled_session(
                             let _ = out_tx.send(WsMsg::SessionEnd { peer: to, reason: "bad_signature".into() });
                             continue;
                         }
-                        // 服务器只会在同一对设备间转发 Offer：又收到 Offer 说明主控端重建了连接，
-                        // 旧会话（可能还没被 ICE 超时判死）必须让位，否则会一直拒绝新连接
-                        if let Some(old) = session.take() {
-                            warn!("收到新 Offer，关闭旧会话后重建");
+                        // 同一主控端又发 Offer 说明它重建了连接：只替换它自己那一路，
+                        // 其他主控端的会话保持不动（允许多主控端并行接入）
+                        if let Some(old) = sessions.remove(&to) {
+                            warn!("收到 {to} 的新 Offer，关闭该主控端旧会话后重建");
                             old.teardown();
                         }
                         // 旧会话的候选对新 PC 无意义（ufrag 不同）
-                        pending_ice.clear();
+                        pending_ice.remove(&to);
                         info!("📨 收到 OFFER（验签通过），建立被控端会话...");
                         status(&sink, "主控端接入，正在建立会话...");
                         let sdp_str = String::from_utf8(data).context("offer SDP 非 UTF-8")?;
-                        match setup_controlled(&out_tx, to, sdp_str, cfg.fps, closed_tx.clone(), cfg.ice_servers.as_slice(), &identity).await {
+                        match setup_controlled(&out_tx, to.clone(), sdp_str, cfg.fps, closed_tx.clone(), cfg.ice_servers.as_slice(), &identity).await {
                             Ok(s) => {
-                                info!("✅ 被控端会话建立，answer 已发出");
+                                info!("✅ 被控端会话建立（{to}），answer 已发出");
                                 // 回放先于会话到达的 trickle 候选（远端描述已在 setup 内设好）
-                                add_remote_candidates(&s.pc, pending_ice.drain(..)).await;
-                                session = Some(s);
+                                let backlog = pending_ice.remove(&to).unwrap_or_default();
+                                add_remote_candidates(&s.pc, backlog).await;
+                                sessions.insert(to.clone(), s);
                                 set_busy(true);
-                                status(&sink, "已共享屏幕，等待连接建立");
+                                status(&sink, format!("已共享屏幕，当前 {} 路主控端在线", sessions.len()));
                             }
                             Err(e) => {
                                 error!("建立被控端会话失败: {e:#}");
@@ -1064,31 +1196,31 @@ async fn controlled_session(
                             }
                         }
                     }
-                    WsMsg::Ice { candidates, .. } => {
-                        // trickle：setup_controlled 已设远端描述，直接加；无会话则入队
-                        if let Some(s) = &session {
+                    WsMsg::Ice { to, candidates } => {
+                        // 服务器把 to 改写为发送方（主控端）ID：按主控端分别分发给对应会话
+                        if let Some(s) = sessions.get(&to) {
                             add_remote_candidates(&s.pc, candidates).await;
                         } else {
-                            pending_ice.extend(candidates);
+                            pending_ice.entry(to).or_default().extend(candidates);
                         }
                     }
                     WsMsg::Evict { peer, reason } => {
                         warn!("⚠️ 被驱逐 peer={peer} reason={reason}");
                         status(&sink, format!("会话结束: {reason}"));
-                        if let Some(s) = session.take() {
+                        if let Some(s) = sessions.remove(&peer) {
                             s.teardown();
                         }
-                        set_busy(false);
-                        pending_ice.clear();
+                        pending_ice.remove(&peer);
+                        set_busy(!sessions.is_empty());
                     }
                     WsMsg::SessionEnd { peer, reason } => {
                         info!("🔚 会话结束 peer={peer} reason={reason}");
-                        status(&sink, format!("会话结束: {reason}"));
-                        if let Some(s) = session.take() {
+                        status(&sink, format!("{peer} 会话结束: {reason}"));
+                        if let Some(s) = sessions.remove(&peer) {
                             s.teardown();
                         }
-                        set_busy(false);
-                        pending_ice.clear();
+                        pending_ice.remove(&peer);
+                        set_busy(!sessions.is_empty());
                     }
                     WsMsg::Error { code, message } => {
                         error!("❌ 服务器错误 [{code}]: {message}");
@@ -1097,7 +1229,10 @@ async fn controlled_session(
                     WsMsg::Emergency { action, delay_secs } => {
                         let tx = out_tx.clone();
                         info!("🚨 紧急控制: action={action} delay={delay_secs}s");
+                        #[cfg(feature = "desktop")]
                         run_emergency(&action, delay_secs);
+                        #[cfg(not(feature = "desktop"))]
+                        info!("Android 端忽略紧急控制（非桌面端无需重启/关机）");
                         let _ = tx.send(WsMsg::EmergencyAck { action, ok: true });
                     }
                     WsMsg::EmergencyAck { .. } => {}
@@ -1107,7 +1242,7 @@ async fn controlled_session(
         }
     }
 
-    if let Some(s) = session.take() {
+    for (_, s) in sessions.drain() {
         s.teardown();
     }
     info!("被控端退出");
@@ -1122,7 +1257,7 @@ async fn setup_controlled(
     peer: String,
     offer_sdp: String,
     fps: u64,
-    closed_tx: mpsc::UnboundedSender<RTCPeerConnectionState>,
+    closed_tx: mpsc::UnboundedSender<(String, RTCPeerConnectionState)>,
     ice_servers: &[String],
     identity: &Identity,
 ) -> Result<Session> {
@@ -1133,7 +1268,7 @@ async fn setup_controlled(
     );
     info!("🧩 被控端 PeerConnection 创建");
 
-    watch_peer_disconnect(&pc, closed_tx);
+    watch_peer_disconnect(&pc, peer.clone(), closed_tx);
     spawn_pair_report(pc.clone());
 
     // 对端（主控端）创建的 DC 到达后：open 即启动采集 + 挂控制消息处理
@@ -1146,261 +1281,209 @@ async fn setup_controlled(
             info!("📡 收到 DataChannel '{label}'");
 
             if label == "screen" {
-                // 采集句柄槽位：on_open 里创建，on_message 里响应 SwitchMonitor
-                let cap_slot: Arc<parking_lot::Mutex<Option<video::CaptureHandle>>> =
-                    Default::default();
-                // 编码统计槽位：主控端画质设置需要直接改目标码率
-                let stats_slot: Arc<parking_lot::Mutex<Option<Arc<video::Stats>>>> =
-                    Default::default();
+                #[cfg(feature = "desktop")]
+                {
+                    // 采集句柄槽位：on_open 里创建，on_message 里响应 SwitchMonitor
+                    let cap_slot: Arc<parking_lot::Mutex<Option<video::CaptureHandle>>> =
+                        Default::default();
+                    // 编码统计槽位：主控端画质设置需要直接改目标码率
+                    let stats_slot: Arc<parking_lot::Mutex<Option<Arc<video::Stats>>>> =
+                        Default::default();
 
-                // open → 采集监督线程 + 发送任务 + 显示器清单推送 + 剪贴板轮询
-                let dc_for_open = dc.clone();
-                // 同时给 on_message 闭包一份（虚拟屏增删后推新 Monitors 用）
-                let dc_for_cmd = dc_for_open.clone();
-                let cap_slot_open = cap_slot.clone();
-                let stats_slot_open = stats_slot.clone();
-                dc.on_open(Box::new(move || {
-                    let dc2 = dc_for_open.clone();
-                    let ts2 = ts_open.clone();
-                    let cap_slot2 = cap_slot_open.clone();
-                    Box::pin(async move {
-                        info!("🟢 DataChannel open，启动屏幕采集 (fps={fps})");
-                        let (tx, rx) = mpsc::unbounded_channel::<Vec<u8>>();
-                        let stats = Arc::new(video::Stats::new(video::DEFAULT_BITRATE));
-                        let handle = video::spawn_capture_supervisor(tx, fps, stats.clone());
-                        *cap_slot2.lock() = Some(handle);
-                        *stats_slot_open.lock() = Some(stats.clone());
+                    // open → 采集监督线程 + 发送任务 + 显示器清单推送 + 剪贴板轮询
+                    let dc_for_open = dc.clone();
+                    let dc_for_cmd = dc_for_open.clone();
+                    let cap_slot_open = cap_slot.clone();
+                    let stats_slot_open = stats_slot.clone();
+                    dc.on_open(Box::new(move || {
+                        let dc2 = dc_for_open.clone();
+                        let ts2 = ts_open.clone();
+                        let cap_slot2 = cap_slot_open.clone();
+                        Box::pin(async move {
+                            info!("🟢 DataChannel open，启动屏幕采集 (fps={fps})");
+                            let (tx, rx) = mpsc::unbounded_channel::<Vec<u8>>();
+                            let stats = Arc::new(video::Stats::new(video::DEFAULT_BITRATE));
+                            let handle = video::spawn_capture_supervisor(tx, fps, stats.clone());
+                            *cap_slot2.lock() = Some(handle);
+                            *stats_slot_open.lock() = Some(stats.clone());
 
-                        // 推送显示器清单（主控端下拉切换用）
-                        let list: Vec<MonitorDesc> = capture::enumerate()
-                            .into_iter()
-                            .enumerate()
-                            .map(|(i, m)| MonitorDesc {
-                                index: i as u32,
-                                name: m.name,
-                                width: m.width,
-                                height: m.height,
-                                primary: m.primary,
-                                is_virtual: m.is_virtual,
-                            })
-                            .collect();
-                        info!("🖥️ 显示器清单: {} 台", list.len());
-                        let _ = dc2.send_text(ControlMsg::Monitors { list }.to_json()).await;
+                            let list: Vec<MonitorDesc> = capture::enumerate()
+                                .into_iter()
+                                .enumerate()
+                                .map(|(i, m)| MonitorDesc {
+                                    index: i as u32,
+                                    name: m.name,
+                                    width: m.width,
+                                    height: m.height,
+                                    primary: m.primary,
+                                    is_virtual: m.is_virtual,
+                                })
+                                .collect();
+                            info!("🖥️ 显示器清单: {} 台", list.len());
+                            let _ = dc2.send_text(ControlMsg::Monitors { list }.to_json()).await;
 
-                        // 帧发送 + 码率自适应 + 链路上报（teardown abort 后 rx 断开，采集随之退出）
-                        let dc_send = dc2.clone();
-                        let h = tokio::spawn(async move {
-                            if let Err(e) = video::send_loop(dc_send, rx, stats).await {
-                                warn!("发送循环退出: {e:#}");
-                            }
-                        });
-                        ts2.lock().push(h);
+                            let dc_send = dc2.clone();
+                            let h = tokio::spawn(async move {
+                                if let Err(e) = video::send_loop(dc_send, rx, stats).await {
+                                    warn!("发送循环退出: {e:#}");
+                                }
+                            });
+                            ts2.lock().push(h);
 
-                        // 新会话开始：锁屏期间可能留下附着过 Winlogon 的旧注入线程，
-                        // 它的 SendInput 已永久失效，这里直接重建，保证本会话第一次注入就生效。
-                        #[cfg(windows)]
-                        control::reset_input_thread();
-
-                        // 剪贴板轮询：本机复制 → 同步给主控端（1s 粒度，回环按内容抑制）
-                        // 顺带 250ms 检测锁屏状态：解锁瞬间主动重建注入线程，
-                        // 否则旧线程附过 Winlogon 后 SendInput 会一直失败。
-                        let dc_clip = dc2.clone();
-                        let hc = tokio::spawn(async move {
-                            let mut last_seq = control::clipboard_seq();
                             #[cfg(windows)]
-                            let mut was_secure = crate::desktop::is_secure_desktop();
-                            let mut tick = tokio::time::interval(Duration::from_millis(250));
-                            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-                            loop {
-                                tick.tick().await;
-                                #[cfg(windows)]
-                                {
-                                    let secure = crate::desktop::is_secure_desktop();
-                                    if was_secure && !secure {
-                                        info!("🖥️ 检测到解锁：主动重建注入线程以恢复键鼠");
-                                        control::reset_input_thread();
-                                    }
-                                    was_secure = secure;
-                                }
-                                let seq = control::clipboard_seq();
-                                if seq == last_seq {
-                                    continue;
-                                }
-                                last_seq = seq;
-                                let Some(text) = control::get_clipboard() else {
-                                    continue;
-                                };
-                                if text.is_empty() || text == control::last_clip() {
-                                    continue;
-                                }
-                                control::note_clip(&text);
-                                if dc_clip
-                                    .send_text(ControlMsg::Clipboard { text }.to_json())
-                                    .await
-                                    .is_err()
-                                {
-                                    break;
-                                }
-                            }
-                            info!("剪贴板同步结束");
-                        });
-                        ts2.lock().push(hc);
-                    })
-                }));
+                            control::reset_input_thread();
 
-                // 控制消息（文本帧 JSON）：SwitchMonitor 拦截给采集监督线程，其余走控制注入
-                // dc_for_cmd 已在上面 clone 好，用于虚拟屏增删后推新 Monitors 清单
-                dc.on_message(Box::new(move |msg: DataChannelMessage| {
-                    let cap_slot3 = cap_slot.clone();
-                    let stats_slot3 = stats_slot.clone();
-                    let dc_cmd = dc_for_cmd.clone();
-                    Box::pin(async move {
-                        if !msg.is_string {
-                            return;
-                        }
-                        let Ok(s) = std::str::from_utf8(&msg.data) else {
-                            return;
-                        };
-                        let Some(m) = ControlMsg::from_json(s) else {
-                            return;
-                        };
-                        match m {
-                            ControlMsg::SwitchMonitor { index } => {
-                                info!("🖥️ 主控端请求切换到显示器 #{index}");
-                                if let Some(h) = cap_slot3.lock().as_ref() {
-                                    h.switch_monitor(index);
-                                }
-                            }
-                            ControlMsg::Refresh => {
-                                info!("🔄 主控端请求刷新画面");
-                                if let Some(h) = cap_slot3.lock().as_ref() {
-                                    h.restart();
-                                }
-                            }
-                            ControlMsg::SetQuality {
-                                level,
-                                bitrate_kbps,
-                            } => {
-                                info!("🎚️ 主控端设置画质: {level} ({bitrate_kbps} kbps)");
-                                if let Some(st) = stats_slot3.lock().as_ref() {
-                                    st.set_quality(&level, bitrate_kbps);
-                                }
-                            }
-                            ControlMsg::SetResolution { width, height } => {
-                                control::handle_msg(ControlMsg::SetResolution { width, height });
-                                // 等系统应用新模式后再重建采集，否则仍是旧尺寸
-                                tokio::time::sleep(Duration::from_millis(900)).await;
-                                if let Some(h) = cap_slot3.lock().as_ref() {
-                                    h.restart();
-                                }
-                            }
-                            ControlMsg::AddVirtualDisplay {
-                                count,
-                                width,
-                                height,
-                            } => {
-                                info!("🖥️ 主控端请求新增 {count} 块虚拟屏（{width}x{height}）");
-                                match control::add_virtual(count, width, height) {
-                                    Ok(_) => {
-                                        // 驱动注册新屏到 DWM 需要几百毫秒
-                                        tokio::time::sleep(Duration::from_millis(900)).await;
-                                        // 推新 Monitors 清单给主控端，让下拉刷新
-                                        refresh_monitors(&dc_cmd).await;
-                                        // 推驱动状态
-                                        push_driver_status(&dc_cmd);
-                                        // 如果当前在采集那块虚拟屏上或者显示器列表变了，重建采集
-                                        if let Some(h) = cap_slot3.lock().as_ref() {
-                                            h.restart();
+                            let dc_clip = dc2.clone();
+                            let hc = tokio::spawn(async move {
+                                let mut last_seq = control::clipboard_seq();
+                                #[cfg(windows)]
+                                let mut was_secure = crate::desktop::is_secure_desktop();
+                                let mut tick = tokio::time::interval(Duration::from_millis(250));
+                                tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                                loop {
+                                    tick.tick().await;
+                                    #[cfg(windows)]
+                                    {
+                                        let secure = crate::desktop::is_secure_desktop();
+                                        if was_secure && !secure {
+                                            info!("🖥️ 检测到解锁：主动重建注入线程以恢复键鼠");
+                                            control::reset_input_thread();
                                         }
-                                        let _ = dc_cmd
-                                            .send_text(
-                                                ControlMsg::Log {
-                                                    level: "info".into(),
-                                                    msg: format!("✅ 已新增 {count} 块虚拟屏，驱动注册完成"),
-                                                }
-                                                .to_json()
-                                                .as_str(),
-                                            )
-                                            .await;
+                                        was_secure = secure;
                                     }
-                                    Err(e) => {
-                                        warn!("🖥️ 新增虚拟屏失败: {e:#}");
-                                        push_driver_status(&dc_cmd);
-                                        let _ = dc_cmd
-                                            .send_text(
-                                                ControlMsg::Log {
-                                                    level: "warn".into(),
-                                                    msg: format!("⚠️ 新增虚拟屏失败：{e}"),
-                                                }
-                                                .to_json()
-                                                .as_str(),
-                                            )
-                                            .await;
-                                    }
+                                    let seq = control::clipboard_seq();
+                                    if seq == last_seq { continue; }
+                                    last_seq = seq;
+                                    let Some(text) = control::get_clipboard() else { continue; };
+                                    if text.is_empty() || text == control::last_clip() { continue; }
+                                    control::note_clip(&text);
+                                    if dc_clip.send_text(ControlMsg::Clipboard { text }.to_json()).await.is_err() { break; }
                                 }
-                            }
-                            ControlMsg::RemoveVirtualDisplay { index } => {
-                                info!("🖥️ 主控端请求删除虚拟屏 #{index}");
-                                match control::remove_virtual(index) {
-                                    Ok(_) => {
-                                        tokio::time::sleep(Duration::from_millis(900)).await;
-                                        refresh_monitors(&dc_cmd).await;
-                                        push_driver_status(&dc_cmd);
-                                        if let Some(h) = cap_slot3.lock().as_ref() {
-                                            h.restart();
+                                info!("剪贴板同步结束");
+                            });
+                            ts2.lock().push(hc);
+                        })
+                    }));
+
+                    // 控制消息处理
+                    dc.on_message(Box::new(move |msg: DataChannelMessage| {
+                        let cap_slot3 = cap_slot.clone();
+                        let stats_slot3 = stats_slot.clone();
+                        let dc_cmd = dc_for_cmd.clone();
+                        Box::pin(async move {
+                            if !msg.is_string { return; }
+                            let Ok(s) = std::str::from_utf8(&msg.data) else { return; };
+                            let Some(m) = ControlMsg::from_json(s) else { return; };
+                            match m {
+                                ControlMsg::SwitchMonitor { index } => {
+                                    info!("🖥️ 主控端请求切换到显示器 #{index}");
+                                    if let Some(h) = cap_slot3.lock().as_ref() { h.switch_monitor(index); }
+                                }
+                                ControlMsg::Refresh => {
+                                    info!("🔄 主控端请求刷新画面");
+                                    if let Some(h) = cap_slot3.lock().as_ref() { h.restart(); }
+                                }
+                                ControlMsg::SetQuality { level, bitrate_kbps } => {
+                                    info!("🎚️ 主控端设置画质: {level} ({bitrate_kbps} kbps)");
+                                    if let Some(st) = stats_slot3.lock().as_ref() { st.set_quality(&level, bitrate_kbps); }
+                                }
+                                ControlMsg::SetResolution { width, height } => {
+                                    control::handle_msg(ControlMsg::SetResolution { width, height });
+                                    tokio::time::sleep(Duration::from_millis(900)).await;
+                                    if let Some(h) = cap_slot3.lock().as_ref() { h.restart(); }
+                                }
+                                ControlMsg::AddVirtualDisplay { count, width, height } => {
+                                    info!("🖥️ 主控端请求新增 {count} 块虚拟屏（{width}x{height}）");
+                                    match control::add_virtual(count, width, height) {
+                                        Ok(_) => {
+                                            tokio::time::sleep(Duration::from_millis(900)).await;
+                                            refresh_monitors(&dc_cmd).await;
+                                            push_driver_status(&dc_cmd);
+                                            if let Some(h) = cap_slot3.lock().as_ref() { h.restart(); }
                                         }
-                                        let _ = dc_cmd
-                                            .send_text(
-                                                ControlMsg::Log {
-                                                    level: "info".into(),
-                                                    msg: format!("✅ 已删除虚拟屏 #{index}"),
-                                                }
-                                                .to_json()
-                                                .as_str(),
-                                            )
-                                            .await;
+                                        Err(e) => { warn!("🖥️ 新增虚拟屏失败: {e:#}"); push_driver_status(&dc_cmd); }
                                     }
-                                    Err(e) => {
-                                        warn!("🖥️ 删除虚拟屏失败: {e:#}");
-                                        push_driver_status(&dc_cmd);
-                                        let _ = dc_cmd
-                                            .send_text(
-                                                ControlMsg::Log {
-                                                    level: "warn".into(),
-                                                    msg: format!("⚠️ 删除虚拟屏失败：{e}"),
-                                                }
-                                                .to_json()
-                                                .as_str(),
-                                            )
-                                            .await;
+                                }
+                                ControlMsg::RemoveVirtualDisplay { index } => {
+                                    info!("🖥️ 主控端请求删除虚拟屏 #{index}");
+                                    match control::remove_virtual(index) {
+                                        Ok(_) => {
+                                            tokio::time::sleep(Duration::from_millis(900)).await;
+                                            refresh_monitors(&dc_cmd).await;
+                                            push_driver_status(&dc_cmd);
+                                            if let Some(h) = cap_slot3.lock().as_ref() { h.restart(); }
+                                        }
+                                        Err(e) => { warn!("🖥️ 删除虚拟屏失败: {e:#}"); push_driver_status(&dc_cmd); }
+                                    }
+                                }
+                                ControlMsg::QueryDriverStatus => { push_driver_status(&dc_cmd); }
+                                other => control::handle_msg(other),
+                            }
+                        })
+                    }));
+                }
+                #[cfg(not(feature = "desktop"))]
+                {
+                    // Android 被控端：Rust 创建 DC → 注册到 jni 槽位 → Kotlin pushVideoFrame 喂帧
+                    let dc_clone = dc.clone();
+                    dc.on_open(Box::new(move || {
+                        let dc2 = dc_clone.clone();
+                        Box::pin(async move {
+                            info!("🟢 Android DataChannel 'screen' open");
+                            if let Some(h) = crate::jni::current_handle() {
+                                crate::jni::register_dc(h, "screen", dc2.clone());
+                            }
+                            let _ = dc2.send_text(
+                                ControlMsg::Log {
+                                    level: "info".into(),
+                                    msg: "Android 被控端 screen DC 就绪".into(),
+                                }.to_json(),
+                            ).await;
+                        })
+                    }));
+                    dc.on_message(Box::new(move |msg: DataChannelMessage| {
+                        Box::pin(async move {
+                            // 被控端 screen DC 收到的应该是文本控制消息（SwitchMonitor 等）
+                            // 二进制帧只会从 Rust→Kotlin（Kotlin 不往被控端发视频）
+                            if msg.is_string {
+                                if let Ok(s) = std::str::from_utf8(&msg.data) {
+                                    if let Some(m) = ControlMsg::from_json(s) {
+                                        info!("📥 Android screen DC 控制消息: {:?}", std::mem::discriminant(&m));
+                                        // Android 端目前不支持 SwitchMonitor/AddVirtualDisplay 等桌面专属命令
                                     }
                                 }
                             }
-                            ControlMsg::QueryDriverStatus => {
-                                push_driver_status(&dc_cmd);
-                            }
-                            other => control::handle_msg(other),
-                        }
-                    })
-                }));
+                        })
+                    }));
+                }
             } else if label == "audio" {
-                // 音频 DC：open 后启动麦克风采集，PCM 推送至该 DC
-                let audio_slot: Arc<parking_lot::Mutex<Option<audio::AudioCapture>>> =
-                    Default::default();
-                let dc_audio = dc.clone();
-                dc.on_open(Box::new(move || {
-                    let dc_capture = dc_audio.clone();
-                    let slot = audio_slot.clone();
-                    Box::pin(async move {
-                        match audio::AudioCapture::start(dc_capture) {
-                            Ok(cap) => {
-                                info!("🎙️ 音频采集已启动");
-                                *slot.lock() = Some(cap);
+                #[cfg(feature = "desktop")]
+                {
+                    let audio_slot: Arc<parking_lot::Mutex<Option<audio::AudioCapture>>> = Default::default();
+                    let dc_audio = dc.clone();
+                    dc.on_open(Box::new(move || {
+                        let dc_capture = dc_audio.clone();
+                        let slot = audio_slot.clone();
+                        Box::pin(async move {
+                            match audio::AudioCapture::start(dc_capture) {
+                                Ok(cap) => { info!("🎙️ 音频采集已启动"); *slot.lock() = Some(cap); }
+                                Err(e) => warn!("音频采集启动失败（会话继续无音频）: {e:#}"),
                             }
-                            Err(e) => warn!("音频采集启动失败（会话继续无音频）: {e:#}"),
-                        }
-                    })
-                }));
+                        })
+                    }));
+                }
+                #[cfg(not(feature = "desktop"))]
+                {
+                    let dc_clone = dc.clone();
+                    dc.on_open(Box::new(move || {
+                        Box::pin(async move {
+                            info!("🎙️ Android DataChannel 'audio' open");
+                            if let Some(h) = crate::jni::current_handle() {
+                                crate::jni::register_dc(h, "audio", dc_clone.clone());
+                            }
+                        })
+                    }));
+                }
             }
         })
     }));

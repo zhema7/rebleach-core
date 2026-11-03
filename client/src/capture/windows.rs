@@ -7,6 +7,13 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
 use std::time::{Duration, Instant};
 
+use parking_lot::Mutex;
+
+/// 全局采集后端独占锁：任何时刻只能有一个 Capture 实例在采集。
+/// start_for 入口先停掉上一个（设 stop 信号 + 等待短暂时间让旧线程退出），
+/// 然后再启动新的。保证 DDA / GDI / WGC 三种 backend 不会同时跑。
+static ACTIVE_STOP: Mutex<Option<Arc<AtomicBool>>> = Mutex::new(None);
+
 use anyhow::{Context, Result, anyhow};
 use tracing::{debug, info, warn};
 use windows::Foundation::TypedEventHandler;
@@ -197,14 +204,21 @@ pub struct Capture {
 }
 
 impl Capture {
-    /// 建立采集会话。后端优先顺序：**DXGI 桌面复制 (DDA)** → WGC → GDI。
+    /// 建立采集会话。后端优先顺序：**DXGI 桌面复制 (DDA)** → GDI。
+    /// WGC 在本机（4K TV + 虚拟显示器共存）上 `CreateForMonitor` 固定返回 0x80070424，
+    /// 已从 fallback 链中移除。详见 P1-2 修复说明。
     ///
-    /// 为什么 DDA 优先：DDA 由桌面更新事件驱动（`AcquireNextFrame`），不依赖 WinRT
-    /// 激活，SYSTEM 进程同样可用；WGC 在本机（4K TV + 虚拟显示器共存）上
-    /// `CreateForMonitor` 固定返回 0x80070424，只能退回 GDI 的 StretchBlt，
-    /// 而 4K 全屏 StretchBlt 单帧要 ~100ms，帧率被钉死在 9fps。
-    /// `monitor`：Some(i) 只试第 i 个显示器；None 逐个尝试直到成功。
+    /// 全局独占：start_for 先停掉任何还在跑的旧采集线程（互斥锁），
+    /// 再启动新的，保证同一时刻只有一个 backend。
     pub fn start_for(monitor: Option<usize>) -> Result<Self> {
+        // —— 全局独占：先停上一个 ——
+        if let Some(old) = ACTIVE_STOP.lock().take() {
+            info!("🖥️ 停掉上一个采集后端，准备启动新的");
+            old.store(true, Ordering::Relaxed);
+            // 给旧线程 300ms 退出时间，避免同显示器 DuplicateOutput 冲突
+            std::thread::sleep(Duration::from_millis(300));
+        }
+
         let mut monitors = enumerate();
         info!("🖥️ 枚举到 {} 个显示器", monitors.len());
         if let Some(i) = monitor {
@@ -221,18 +235,41 @@ impl Capture {
 
         // —— 后端 1：DXGI 桌面复制 ——
         match Self::start_dda(&monitors) {
-            Ok(c) => return Ok(c),
-            Err(e) => warn!("🖥️ DDA 不可用，尝试 WGC：{e:#}"),
+            Ok(c) => {
+                // 注册停止信号
+                if let Some(ref stop) = c.dda_stop {
+                    *ACTIVE_STOP.lock() = Some(stop.clone());
+                }
+                return Ok(c);
+            }
+            Err(e) => {
+                // P1-1 修复：DDA 首次启动 0x80070057 是时序问题（显卡驱动刚就绪前参数错误），
+                // 等 1~2 秒重试一次大概率能成，不要立刻回退 GDI
+                warn!("🖥️ DDA 首次启动失败，1.5s 后重试一次: {e:#}");
+                std::thread::sleep(Duration::from_millis(1500));
+                match Self::start_dda(&monitors) {
+                    Ok(c) => {
+                        if let Some(ref stop) = c.dda_stop {
+                            *ACTIVE_STOP.lock() = Some(stop.clone());
+                        }
+                        return Ok(c);
+                    }
+                    Err(e2) => warn!("🖥️ DDA 重试仍失败: {e2:#}"),
+                }
+            }
         }
 
-        // —— 后端 2：WGC ——
-        match Self::start_wgc(&monitors) {
-            Ok(c) => return Ok(c),
-            Err(e) => warn!("🖥️ WGC 不可用，回退 GDI：{e:#}"),
-        }
+        // P1-2 修复：跳过 WGC——在本机（RTX 3080 + Win11 + 虚拟显示器共存）上
+        // CreateForMonitor 固定返回 0x80070424（服务未安装），
+        // 无例外地注定失败，不再浪费启动时间。DDA 不行就直接 GDI。
+        warn!("🖥️ WGC 已跳过（本机固定 0x80070424），直接 GDI 兜底");
 
-        // —— 后端 3：GDI ——
-        Self::start_gdi(&monitors)
+        // —— 后端 2：GDI ——
+        let c = Self::start_gdi(&monitors)?;
+        if let Some(ref stop) = c.gdi_stop {
+            *ACTIVE_STOP.lock() = Some(stop.clone());
+        }
+        Ok(c)
     }
 
     /// DXGI 桌面复制后端。

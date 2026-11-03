@@ -401,6 +401,8 @@ pub fn spawn(app: AppHandle, cfg: AgentConfig) -> tauri::async_runtime::JoinHand
     tauri::async_runtime::spawn(async move {
         let mut info = collect_info();
         let mut last_geo: Option<Instant> = None;
+        // 指数退避重连计数器：0=刚连上，每次失败+1，稳定 60s 以上清零
+        let mut retry_backoff: u8 = 0;
         loop {
             let need_geo = last_geo
                 .map(|t| t.elapsed() > Duration::from_secs(600))
@@ -461,21 +463,30 @@ pub fn spawn(app: AppHandle, cfg: AgentConfig) -> tauri::async_runtime::JoinHand
                 "agent-status",
                 serde_json::json!({ "status": "正在注册到管理端…", "id": cfg.id }),
             );
-            // 并行等：会话结束（锁屏不再拆会话，避免解锁后重新注册的空窗）
+            // 指数退避重连：2→4→8→…→60s 封顶；会话稳定 60s 以上后计数器清零
+            let session_start = Instant::now();
             let outcome = Some(session::run_session(cfg_run, input_rx, sink).await);
-            let retry_secs = match &outcome {
-                Some(Ok(())) => {
-                    warn!("被控端会话退出，5 秒后重连");
-                    5
-                }
-                Some(Err(e)) => {
-                    warn!("被控端会话失败: {e:#}，5 秒后重连");
-                    5
-                }
-                None => 1,
+            let stable = session_start.elapsed() > Duration::from_secs(60);
+            let delay_secs = {
+                let mut bk = retry_backoff;
+                if stable { bk = 0; } else { bk = (bk + 1).min(5); }
+                retry_backoff = bk;
+                let base = 2u64.saturating_pow(bk as u32).min(60);
+                // 加一点随机抖动（±20%）避免雪崩：用纳秒时间戳做快速伪随机
+                let nanos = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.subsec_nanos() as f64 / 1_000_000_000.0 - 0.5)
+                    .unwrap_or(0.0);
+                let jitter = (base as f64 * 0.2 * nanos) as i64;
+                (base as i64 + jitter).clamp(1, 60) as u64
             };
+            match &outcome {
+                Some(Ok(())) => warn!("被控端会话退出，{delay_secs}s 后重连（退避 {retry_backoff}）"),
+                Some(Err(e)) => warn!("被控端会话失败: {e:#}，{delay_secs}s 后重连（退避 {retry_backoff}）"),
+                None => {}
+            }
             drop(input_tx);
-            tokio::time::sleep(Duration::from_secs(retry_secs)).await;
+            tokio::time::sleep(Duration::from_secs(delay_secs)).await;
         }
     })
 }

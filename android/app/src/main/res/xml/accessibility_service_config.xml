@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- 无障碍服务配置：只做手势注入，不订阅任何事件（省电 + 降攻击面）。
+     用户首次安装后需要手动在"设置 → 无障碍 → Rebleach"里开启。 -->
+<accessibility-service xmlns:android="http://schemas.android.com/apk/res/android"
+    android:accessibilityEventTypes="typeWindowStateChanged"
+    android:accessibilityFeedbackType="feedbackGeneric"
+    android:accessibilityFlags="flagDefault"
+    android:canPerformGestures="true"
+    android:canRetrieveWindowContent="false"
+    android:description="@string/a11y_service_desc"
+    android:packageNames="" />

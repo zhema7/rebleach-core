@@ -573,85 +573,8 @@ fn push_nz<'a>(out: &mut Vec<&'a [u8]>, mut nal: &'a [u8]) {
     }
 }
 
-// ============================================================
-// 主控端：收帧组装器（8 字节头 + 16KB 分块重组），整帧经 mpsc 交解码
-// ============================================================
-pub struct FrameAssembler {
-    hdr: Vec<u8>,
-    payload: Vec<u8>,
-    expected: u32,
-    seq: u32,
-    out: tokio::sync::mpsc::UnboundedSender<Vec<u8>>,
-    frames: u64,
-    total: u64,
-}
-
-impl FrameAssembler {
-    pub fn new(out: tokio::sync::mpsc::UnboundedSender<Vec<u8>>) -> Self {
-        Self {
-            hdr: Vec::with_capacity(8),
-            payload: Vec::new(),
-            expected: 0,
-            seq: 0,
-            out,
-            frames: 0,
-            total: 0,
-        }
-    }
-
-    pub fn feed(&mut self, mut data: &[u8]) {
-        while !data.is_empty() {
-            if self.hdr.len() < 8 {
-                let need = 8 - self.hdr.len();
-                let take = need.min(data.len());
-                self.hdr.extend_from_slice(&data[..take]);
-                data = &data[take..];
-                if self.hdr.len() < 8 {
-                    return;
-                }
-                self.seq = u32::from_le_bytes(self.hdr[0..4].try_into().unwrap());
-                self.expected = u32::from_le_bytes(self.hdr[4..8].try_into().unwrap());
-                self.payload.clear();
-                if self.expected == 0 {
-                    self.finish_frame();
-                    self.hdr.clear();
-                    continue;
-                }
-                if self.expected > 32 * 1024 * 1024 {
-                    error!("帧长度异常 {}，丢弃", self.expected);
-                    self.hdr.clear();
-                    continue;
-                }
-            }
-            let need = self.expected as usize - self.payload.len();
-            let take = need.min(data.len());
-            self.payload.extend_from_slice(&data[..take]);
-            data = &data[take..];
-            if self.payload.len() == self.expected as usize {
-                self.finish_frame();
-                self.hdr.clear();
-            }
-        }
-    }
-
-    fn finish_frame(&mut self) {
-        let len = self.payload.len();
-        if self.out.send(std::mem::take(&mut self.payload)).is_err() {
-            return;
-        }
-        self.frames += 1;
-        self.total += len as u64;
-        if self.frames % 60 == 1 {
-            info!(
-                "📥 收到 {f} 帧, 共 {t} bytes (seq={s}, len={l})",
-                f = self.frames,
-                t = self.total,
-                s = self.seq,
-                l = len
-            );
-        }
-    }
-}
+// FrameAssembler 已提取到 crate::frame_assembler（无 cfg gate，Android/桌面通用）
+pub use crate::frame_assembler::FrameAssembler;
 
 // ============================================================
 // 分辨率与颜色空间转换
@@ -1018,39 +941,5 @@ mod tests {
         }
     }
 
-    // ---------- FrameAssembler ----------
-    #[test]
-    fn frame_assembler_single_chunk() {
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
-        let mut asm = FrameAssembler::new(tx);
-        let payload = b"hello world";
-        // 头：[u32 seq][u32 len]
-        let mut pkt = Vec::new();
-        pkt.extend_from_slice(&1u32.to_le_bytes());
-        pkt.extend_from_slice(&(payload.len() as u32).to_le_bytes());
-        pkt.extend_from_slice(payload);
-        asm.feed(&pkt);
-
-        let got = rx.try_recv().expect("应收到组装好的帧");
-        assert_eq!(got, payload);
-    }
-
-    #[test]
-    fn frame_assembler_split_across_chunks() {
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
-        let mut asm = FrameAssembler::new(tx);
-        let payload = b"abcdefghij";
-        let mut pkt = Vec::new();
-        pkt.extend_from_slice(&7u32.to_le_bytes());
-        pkt.extend_from_slice(&(payload.len() as u32).to_le_bytes());
-        pkt.extend_from_slice(payload);
-
-        // 切成两段喂入
-        asm.feed(&pkt[..6]);
-        assert!(rx.try_recv().is_err(), "头未收完不应出帧");
-        asm.feed(&pkt[6..]);
-
-        let got = rx.try_recv().expect("应收到组装好的帧");
-        assert_eq!(got, payload);
-    }
+    // ---------- FrameAssembler 测试已移至 crate::frame_assembler ----------
 }

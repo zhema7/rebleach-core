@@ -1,0 +1,3 @@
+<resources>
+    <string name="a11y_service_desc">Rebleach 被控端无障碍服务：为主控端提供屏幕上的点击、滑动、长按注入，无需额外权限。</string>
+</resources>

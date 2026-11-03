@@ -8,10 +8,21 @@ repository.workspace = true
 [[bin]]
 name = "rebleach-client"
 path = "src/main.rs"
+# Android 端 main.rs 被 cfg 掉，不需要 bin target
+required-features = ["desktop"]
 
 [lib]
 name = "rebleach_client"
 path = "src/lib.rs"
+# Android 上作为 JNI .so 被 Kotlin 加载（cargo-ndk 构建时生效）
+crate-type = ["lib", "cdylib"]
+
+[features]
+default = ["desktop"]
+# 桌面端：Windows 专属依赖（采集/编码/注入/音频/窗口）
+desktop = ["dep:enigo", "dep:winit", "dep:softbuffer", "dep:windows", "dep:openh264", "dep:cpal", "dep:clap"]
+# Android 端：纯 Rust 核心 + JNI 桥，平台能力（MediaProjection/MediaCodec/无障碍）由 Kotlin 提供
+android = ["dep:jni"]
 
 [dependencies]
 tokio = { version = "1", features = ["full"] }
@@ -29,22 +40,26 @@ anyhow = "1"
 thiserror = "1"
 parking_lot = "0.12"
 base64 = "0.22"
-clap = { version = "4", features = ["derive"] }
 
 # === TOFU 身份校验（ed25519 设备密钥 + SDP 签名） ===
 ed25519-dalek = { version = "2", features = ["rand_core"] }
 rand = "0.8"
 
-# === 输入注入（被控端） ===
-enigo = "0.6"
+# === JNI（Android 端：jni-rs 提供 JNIEnv 和 JByteArray 等安全包装）===
+jni = { version = "0.21", default-features = false, optional = true }
 
-# === 主控端查看器 ===
-winit = "0.30"
-softbuffer = "0.4"
+# === 核心：WebRTC ===
+# webrtc-rs 0.11 纯 Rust 实现（不含 libwebrtc C++），交叉编译 Android 无需 NDK 编 C++
+webrtc = "0.11"
 
-# === 核心：屏幕采集 ===
-# 自研 Windows Graphics Capture + ID3D11VideoProcessor GPU 下采样（见 src/capture.rs）
-windows = { version = "0.62", features = [
+# === 桌面端专属依赖（feature-gate 掉，Android 端不编译） ===
+enigo = { version = "0.6", optional = true }
+winit = { version = "0.30", optional = true }
+softbuffer = { version = "0.4", optional = true }
+openh264 = { version = "0.8", optional = true }
+cpal = { version = "0.15", optional = true }
+clap = { version = "4", features = ["derive"], optional = true }
+windows = { version = "0.62", optional = true, features = [
     "Win32_Foundation",
     "Win32_Graphics_Gdi",
     "Win32_Graphics_Dxgi",
@@ -67,20 +82,3 @@ windows = { version = "0.62", features = [
     "Graphics_DirectX_Direct3D11",
     "Foundation",
 ] }
-
-# === 核心：H.264 编码 ===
-# openh264 是 openh264-sys2 的安全封装（思科 OpenH264，BSD 许可），从源码编译无 DLL 依赖
-openh264 = "0.8"
-
-# === 核心：WebRTC ===
-# webrtc-rs 是纯 Rust WebRTC 实现，4.9k stars
-webrtc = "0.11"
-
-# === 核心：音频（跨平台采集/播放，走独立 DataChannel） ===
-# cpal：Rust 跨平台音频 I/O（Windows/WASAPI、macOS/CoreAudio、Linux/ALSA）
-cpal = "0.15"
-
-# === 核心：输入注入 ===
-# enigo 跨平台键鼠模拟，我们暂时 MVP 只做"被控端不注入，主控端不需要"
-# 后面 MVP 完了再加
-# enigo = "0.6"

@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Base manifest (merge framework). Permissions + application + components
+     are provided by each product flavor's manifest:
+       src/agent/AndroidManifest.xml   (agent: MediaProjection, 无障碍, 前台服务)
+       src/controller/AndroidManifest.xml (controller: 纯网络) -->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <application />
+</manifest>

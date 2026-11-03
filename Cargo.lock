@@ -4470,7 +4470,7 @@ dependencies = [
 
 [[package]]
 name = "rebleach-app"
-version = "0.2.4"
+version = "0.2.5"
 dependencies = [
  "anyhow",
  "arboard",
@@ -4497,7 +4497,7 @@ dependencies = [
 
 [[package]]
 name = "rebleach-client"
-version = "0.2.4"
+version = "0.2.5"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -4507,6 +4507,7 @@ dependencies = [
  "ed25519-dalek",
  "enigo",
  "futures-util",
+ "jni 0.21.1",
  "openh264",
  "parking_lot",
  "rand 0.8.8",
@@ -4527,7 +4528,7 @@ dependencies = [
 
 [[package]]
 name = "rebleach-server"
-version = "0.2.4"
+version = "0.2.5"
 dependencies = [
  "anyhow",
  "axum",
@@ -4554,7 +4555,7 @@ dependencies = [
 
 [[package]]
 name = "rebleach-ui-shim"
-version = "0.2.4"
+version = "0.2.5"
 dependencies = [
  "embed-manifest",
 ]

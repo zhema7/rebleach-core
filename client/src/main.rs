@@ -1,5 +1,7 @@
+#![cfg(feature = "desktop")]
 // Rebleach 客户端 CLI（无界面入口，用于被控端调试 / 自动化测试）
 // 桌面端见 app/src-tauri：Tauri 2 外壳 + WebView + WebCodecs
+// Android 端通过 JNI 入口启动（见 client/src/jni.rs），不需要本文件。
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
