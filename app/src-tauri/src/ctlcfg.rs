@@ -30,6 +30,12 @@ pub struct CtlConfig {
     /// 当前选用的节点 url
     #[serde(default)]
     pub active: String,
+    /// 服务端管理员账号（用于接入配置 / SSH 公钥 / 安装令牌，明文存本机）
+    #[serde(default)]
+    pub admin_user: String,
+    /// 服务端管理员密码（明文存本机）
+    #[serde(default)]
+    pub admin_pass: String,
 }
 
 impl Default for CtlConfig {
@@ -42,6 +48,8 @@ impl Default for CtlConfig {
                 builtin: true,
             }],
             active: DEFAULT_NODE_URL.to_string(),
+            admin_user: String::new(),
+            admin_pass: String::new(),
         }
     }
 }

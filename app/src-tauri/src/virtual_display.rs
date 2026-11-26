@@ -152,6 +152,19 @@ unsafe fn ensure_win() {
             monitors = rebleach_client::capture::enumerate();
         }
         if monitors.is_empty() {
+            // 8.4 无实体显示器：驱动就绪后自动插一块虚拟屏，而不是只装驱动等计划任务兜底
+            if detect_driver() != DriverKind::None {
+                warn!("🖥️ 无实体显示器，自动插入 1 块虚拟屏（{TARGET_W}x{TARGET_H}）");
+                match add_virtual_displays(1, TARGET_W, TARGET_H) {
+                    Ok(()) => {
+                        std::thread::sleep(Duration::from_secs(2));
+                        monitors = rebleach_client::capture::enumerate();
+                    }
+                    Err(e) => warn!("🖥️ 自动插入虚拟屏失败: {e:#}"),
+                }
+            }
+        }
+        if monitors.is_empty() {
             warn!("🖥️ 仍无可用显示器，远程画面将无法采集");
             return;
         }

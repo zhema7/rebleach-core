@@ -121,6 +121,12 @@ async fn main() -> Result<()> {
             } => {
                 println!("[e2e] 驱动状态: driver={driver_kind} has={has_driver} active={active_count} hint={hint}");
             }
+            SessionEvent::Link { .. } => {}
+            SessionEvent::TermReady
+            | SessionEvent::TermOpened { .. }
+            | SessionEvent::TermData { .. }
+            | SessionEvent::TermExit { .. }
+            | SessionEvent::TermErr { .. } => {}
         })
     };
 

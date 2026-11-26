@@ -18,6 +18,7 @@ pub struct Capture {
     pub src_h: u32,
     pub dst_w: u32,
     pub dst_h: u32,
+    pub name: String,
     pub origin_x: i32,
     pub origin_y: i32,
 }

@@ -11,6 +11,12 @@ path = "src/main.rs"
 # Android 端 main.rs 被 cfg 掉，不需要 bin target
 required-features = ["desktop"]
 
+# T3：ProxyCommand 工具——`ssh -o ProxyCommand="rebleach-proxy --device X --stdio %h %p"`
+[[bin]]
+name = "rebleach-proxy"
+path = "src/bin/proxy.rs"
+required-features = ["desktop"]
+
 [lib]
 name = "rebleach_client"
 path = "src/lib.rs"
@@ -45,6 +51,15 @@ base64 = "0.22"
 ed25519-dalek = { version = "2", features = ["rand_core"] }
 rand = "0.8"
 
+# === T3：内置最小 SSH 服务端（仅 Windows 桌面构建使用） ===
+russh = "0.45"
+# russh Handler trait 是 #[async_trait]，impl 侧需要同名属性宏
+async-trait = "0.1"
+
+# === T2：inventory 查询信令服务器设备列表（阻塞 HTTP，放 blocking 线程） ===
+# json 特性启用 into_json 反序列化
+ureq = { version = "2", default-features = false, features = ["tls", "json"] }
+
 # === JNI（Android 端：jni-rs 提供 JNIEnv 和 JByteArray 等安全包装）===
 jni = { version = "0.21", default-features = false, optional = true }
 
@@ -58,7 +73,7 @@ winit = { version = "0.30", optional = true }
 softbuffer = { version = "0.4", optional = true }
 openh264 = { version = "0.8", optional = true }
 cpal = { version = "0.15", optional = true }
-clap = { version = "4", features = ["derive"], optional = true }
+clap = { version = "4", features = ["derive", "env"], optional = true }
 windows = { version = "0.62", optional = true, features = [
     "Win32_Foundation",
     "Win32_Graphics_Gdi",
@@ -69,6 +84,10 @@ windows = { version = "0.62", optional = true, features = [
     "Win32_System_WinRT_Direct3D11",
     "Win32_System_WinRT_Graphics_Capture",
     "Win32_System_Threading",
+    "Win32_System_Console",
+    "Win32_System_Pipes",
+    "Win32_System_Environment",
+    "Win32_Security",
     "Win32_System_DataExchange",
     "Win32_System_Memory",
     "Win32_System_Ole",
@@ -77,6 +96,7 @@ windows = { version = "0.62", optional = true, features = [
     "Win32_System_RemoteDesktop",
     "Win32_UI_Input_KeyboardAndMouse",
     "Win32_UI_WindowsAndMessaging",
+    "Win32_UI_Accessibility",
     "Graphics_Capture",
     "Graphics_DirectX",
     "Graphics_DirectX_Direct3D11",

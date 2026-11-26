@@ -19,6 +19,8 @@ pub const DEFAULT_SERVER: &str = match option_env!("REBLEACH_DEFAULT_SERVER") {
     Some(v) => v,
     None => "wss://rebleach.example.com/ws",
 };
+/// 仓库内置的占位地址：老安装包写进 agent.json 后，升级新包需要自动纠正
+const PLACEHOLDER_SERVER: &str = "wss://rebleach.example.com/ws";
 const RUN_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Run";
 const RUN_VALUE: &str = "RebleachAgent";
 /// 0.1.x 双角色版本使用的旧 Run 键（拆分后被控端包接管，需清理避免重复自启）
@@ -193,6 +195,11 @@ pub fn load_config() -> AgentConfig {
     };
     if cfg.server.trim().is_empty() {
         cfg.server = DEFAULT_SERVER.to_string();
+    } else if cfg.server.trim() == PLACEHOLDER_SERVER && DEFAULT_SERVER != PLACEHOLDER_SERVER {
+        // 旧安装包把占位地址写进了配置，导致永远连不上真实服务器；升级后自动纠正并落地
+        info!("🔧 服务器地址仍是占位值，已替换为内置地址 {DEFAULT_SERVER}");
+        cfg.server = DEFAULT_SERVER.to_string();
+        let _ = save_config(&cfg);
     }
     if cfg.id.trim().is_empty() {
         cfg.id = gen_id();
@@ -399,6 +406,28 @@ pub fn set_autostart(on: bool) -> Result<(), String> {
 pub fn spawn(app: AppHandle, cfg: AgentConfig) -> tauri::async_runtime::JoinHandle<()> {
     // setup 回调运行在 Tauri 主线程（无 tokio 上下文），必须走 Tauri 运行时
     tauri::async_runtime::spawn(async move {
+        // SSH 公钥同步：启动即拉一次，之后每 60s 一次。
+        // 服务端只返回「有有效 grant 的主控端」登记的公钥，因此撤销授权后最多 60s 自动失效。
+        {
+            let server = cfg.server.clone();
+            let id = cfg.id.clone();
+            tauri::async_runtime::spawn(async move {
+                loop {
+                    let (s, i) = (server.clone(), id.clone());
+                    let res = tokio::task::spawn_blocking(move || {
+                        rebleach_client::sshd::sync_authorized_keys(&s, &i, &identity_path())
+                    })
+                    .await;
+                    match res {
+                        Ok(Ok(n)) => info!("🔐 SSH 授权公钥已同步（{n} 把）"),
+                        Ok(Err(e)) => warn!("SSH 授权公钥同步失败: {e:#}"),
+                        Err(e) => warn!("SSH 公钥同步任务异常: {e}"),
+                    }
+                    tokio::time::sleep(Duration::from_secs(60)).await;
+                }
+            });
+        }
+
         let mut info = collect_info();
         let mut last_geo: Option<Instant> = None;
         // 指数退避重连计数器：0=刚连上，每次失败+1，稳定 60s 以上清零
@@ -444,6 +473,13 @@ pub fn spawn(app: AppHandle, cfg: AgentConfig) -> tauri::async_runtime::JoinHand
                 SessionEvent::Stats { .. } => {}
                 SessionEvent::Log { .. } => {}
                 SessionEvent::DriverStatus { .. } => {}
+                SessionEvent::Link { .. } => {}
+                // 终端事件只发生在主控端；被控端由 term 通道直接驱动
+                SessionEvent::TermReady
+                | SessionEvent::TermOpened { .. }
+                | SessionEvent::TermData { .. }
+                | SessionEvent::TermExit { .. }
+                | SessionEvent::TermErr { .. } => {}
             });
 
             // 保证用户会话里有可采集的桌面（无物理显示器时提升虚拟屏分辨率）
@@ -466,6 +502,13 @@ pub fn spawn(app: AppHandle, cfg: AgentConfig) -> tauri::async_runtime::JoinHand
             // 指数退避重连：2→4→8→…→60s 封顶；会话稳定 60s 以上后计数器清零
             let session_start = Instant::now();
             let outcome = Some(session::run_session(cfg_run, input_rx, sink).await);
+            // 会话结束：还原被主控端改过的显示器分辨率，并停止新窗口归位钩子，
+            // 避免下一次会话/本机使用仍停留在降级档位（文档 P1-C）
+            #[cfg(windows)]
+            {
+                rebleach_client::control::restore_display_modes();
+                rebleach_client::window_placement::disable();
+            }
             let stable = session_start.elapsed() > Duration::from_secs(60);
             let delay_secs = {
                 let mut bk = retry_backoff;

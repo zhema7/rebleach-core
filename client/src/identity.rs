@@ -144,6 +144,13 @@ pub fn pinned_pubkey(store_path: &Path, peer_id: &str) -> Result<Option<String>>
 // 路径与展示辅助
 // ============================================================
 pub fn default_base_dir() -> PathBuf {
+    // 被控端以 Windows 服务运行时，APPDATA 指向 systemprofile，与用户态托盘不一致；
+    // App 启动早期写入 RBLEACH_DATA_DIR（%ProgramData%\Rebleach）统一三者的数据目录。
+    if let Ok(dir) = std::env::var("RBLEACH_DATA_DIR") {
+        if !dir.trim().is_empty() {
+            return PathBuf::from(dir);
+        }
+    }
     if let Ok(appdata) = std::env::var("APPDATA") {
         PathBuf::from(appdata).join("rebleach")
     } else if let Ok(home) = std::env::var("HOME") {

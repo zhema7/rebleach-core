@@ -163,6 +163,11 @@ pub enum ControlMsg {
         x: u32,
         y: u32,
     },
+    /// 鼠标移动（虚拟桌面绝对物理坐标，跨显示器拖拽窗口时使用）
+    MouseMoveAbs {
+        x: i32,
+        y: i32,
+    },
     MouseDown {
         b: u8,
     },
@@ -217,12 +222,57 @@ pub enum ControlMsg {
     FileCancel,
     /// 主控端 → 被控端：强制刷新画面（重建采集/编码，立即出 IDR）
     Refresh,
+    /// 双向：协议版本与能力协商（M1 传输重构）。
+    /// 旧端解析失败即忽略，因此可安全地在兼容通道上发送。
+    /// `caps` 取值：media-dc / input-dc / rtt-probe / feedback
+    Hello {
+        #[serde(default)]
+        proto: u32,
+        #[serde(default)]
+        caps: Vec<String>,
+    },
+    /// 主控端 → 被控端：RTT 探测（ctrl 通道每 1s 一次）
+    Ping {
+        t_ms: u64,
+    },
+    /// 被控端 → 主控端：RTT 探测回显（原样回 t_ms）
+    Pong {
+        t_ms: u64,
+    },
+    /// 主控端 → 被控端：媒体接收反馈（ctrl 通道每 200ms 一次），
+    /// 发送端据此做应用层 AIMD 拥塞控制
+    MediaFeedback {
+        /// 本窗口收到并成功重组的帧数
+        recv_fps: f32,
+        /// 本窗口丢弃的整帧数（缺片 / 超时）
+        lost_frames: u32,
+        /// 有效吞吐（kbps）
+        goodput_kbps: f32,
+        /// 到达间隔抖动（ms）
+        jitter_ms: f32,
+        /// ctrl 通道 Ping/Pong 测得的 RTT（ms）
+        rtt_ms: f32,
+    },
+    /// 主控端 → 被控端：请求立即输出关键帧（限流 1 次/秒，由发送端再兜一层）
+    RequestKeyframe,
+    /// 主控端 → 被控端：自愈重启。soft=true 只重建采集/编码；
+    /// soft=false 重启 Agent 进程（画面卡死且软重建无效时使用）
+    RestartAgent {
+        #[serde(default)]
+        soft: bool,
+        #[serde(default)]
+        reason: String,
+    },
     /// 主控端 → 被控端：切换画质档位
     /// level: low（流畅）/ balanced（均衡）/ high（高清）/ custom（自定义码率）
+    /// max_width: 编码宽度上限（像素）。0 = 保持不变（旧主控端兼容）；
+    /// 1 = 不限制（原画，跟随被控端显示器分辨率）；>=640 = 指定上限
     SetQuality {
         level: String,
         #[serde(default)]
         bitrate_kbps: u32,
+        #[serde(default)]
+        max_width: u32,
     },
     /// 主控端 → 被控端：修改当前显示器分辨率（0x0 表示恢复原始）
     SetResolution {
@@ -289,6 +339,12 @@ pub struct MonitorDesc {
     /// 主控端下拉框显示「💻」标识；虚拟屏上 SetResolution 兼容性更好
     #[serde(default)]
     pub is_virtual: bool,
+    /// 该显示器左上角在虚拟桌面中的物理坐标（可为负）。
+    /// 主控端据此把 canvas 坐标换算成绝对坐标，实现跨屏拖拽窗口
+    #[serde(default)]
+    pub origin_x: i32,
+    #[serde(default)]
+    pub origin_y: i32,
 }
 
 fn default_virtual_w() -> u32 {
@@ -353,9 +409,11 @@ mod tests {
                 height: 1080,
                 primary: true,
                 is_virtual: false,
+                origin_x: 0,
+                origin_y: 0,
             }],
         });
-        // 没有 is_virtual 字段的旧 JSON 反序列化应兼容（serde default = false）
+        // 没有 is_virtual/origin 字段的旧 JSON 反序列化应兼容（serde default）
         let json_old =
             r#"{"t":"monitors","list":[{"index":1,"name":"DISPLAY2","width":1920,"height":1080,"primary":false}]}"#;
         let back = ControlMsg::from_json(json_old).expect("旧格式应可反序列化");
@@ -500,12 +558,60 @@ mod tests {
     }
 
     #[test]
+    fn control_media_proto_roundtrip() {
+        roundtrip_control(ControlMsg::Hello {
+            proto: 2,
+            caps: vec!["media-dc".into(), "input-dc".into()],
+        });
+        roundtrip_control(ControlMsg::Ping { t_ms: 12345 });
+        roundtrip_control(ControlMsg::Pong { t_ms: 12345 });
+        roundtrip_control(ControlMsg::MediaFeedback {
+            recv_fps: 29.5,
+            lost_frames: 2,
+            goodput_kbps: 2048.0,
+            jitter_ms: 4.2,
+            rtt_ms: 88.0,
+        });
+        roundtrip_control(ControlMsg::RequestKeyframe);
+        // 极简 Hello（旧端/未来端字段缺失）也应可解析
+        let back = ControlMsg::from_json(r#"{"t":"hello","proto":2}"#).expect("可反序列化");
+        match back {
+            ControlMsg::Hello { proto, caps } => {
+                assert_eq!(proto, 2);
+                assert!(caps.is_empty());
+            }
+            _ => panic!("unexpected variant"),
+        }
+    }
+
+    #[test]
     fn control_desktop_actions_roundtrip() {
         roundtrip_control(ControlMsg::Refresh);
+        roundtrip_control(ControlMsg::RestartAgent {
+            soft: false,
+            reason: "pipeline stalled".into(),
+        });
+        // 兼容旧主控端：字段全部可省
+        let back = ControlMsg::from_json(r#"{"t":"restart_agent"}"#).expect("可反序列化");
+        match back {
+            ControlMsg::RestartAgent { soft, reason } => {
+                assert!(!soft);
+                assert!(reason.is_empty());
+            }
+            _ => panic!("unexpected variant"),
+        }
         roundtrip_control(ControlMsg::SetQuality {
             level: "balanced".into(),
             bitrate_kbps: 2000,
+            max_width: 1920,
         });
+        // 旧主控端不带 max_width：反序列化后为 0（不改变编码宽度）
+        let old_q = ControlMsg::from_json(r#"{"t":"set_quality","level":"high","bitrate_kbps":4000}"#)
+            .expect("旧画质消息应可反序列化");
+        match old_q {
+            ControlMsg::SetQuality { max_width, .. } => assert_eq!(max_width, 0),
+            _ => panic!("unexpected variant"),
+        }
         roundtrip_control(ControlMsg::SetResolution {
             width: 1920,
             height: 1080,

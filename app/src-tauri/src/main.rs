@@ -11,6 +11,8 @@ mod agent_app;
 mod child;
 #[cfg(feature = "controller")]
 mod controller;
+#[cfg(all(feature = "controller", windows))]
+mod win_key_hook;
 #[cfg(feature = "controller")]
 mod ctlcfg;
 mod lan;
@@ -134,6 +136,14 @@ fn open_log_file() -> Option<std::sync::Mutex<std::fs::File>> {
 }
 
 fn main() {
+    // 统一机器级数据目录：服务 / SYSTEM 托盘 / 用户托盘都以 %ProgramData%\Rebleach 为准。
+    // 客户端库的 identity::default_base_dir() 优先读该变量，否则 SYSTEM 下会落到 systemprofile，
+    // 导致 SSH 公钥/身份文件与 Agent 实际目录不一致。
+    #[cfg(all(feature = "agent", windows))]
+    unsafe {
+        std::env::set_var("RBLEACH_DATA_DIR", agent::data_dir());
+    }
+
     init_tracing();
     init_tls_provider();
 

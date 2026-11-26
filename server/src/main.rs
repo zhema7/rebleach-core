@@ -51,6 +51,11 @@ struct Cli {
     /// 临时凭据有效期（秒）。只覆盖单次建连，不覆盖整个会话，故默认压到 10 分钟
     #[arg(long, default_value_t = 600)]
     turn_ttl: u64,
+
+    /// 对外可访问地址（如 https://signal.example.com 或 wss://signal.example.com/ws）。
+    /// 用于生成一键安装脚本与下发配置；留空则按请求 Host / X-Forwarded-Proto 推导
+    #[arg(long, default_value = "")]
+    public_url: String,
 }
 
 // ============================================================
@@ -234,6 +239,8 @@ struct AppState {
     packages_dir: Arc<String>,
     /// (TURN 地址, static-auth-secret, 有效期秒)；secret 为空表示不下发
     turn: Arc<(String, String, u64)>,
+    /// 对外地址（可空，空则按请求头推导）
+    public_url: Arc<String>,
 }
 
 impl AppState {
@@ -307,7 +314,29 @@ fn db_init(conn: &Connection) -> Result<()> {
             peer TEXT,
             detail TEXT
         );
-        CREATE INDEX IF NOT EXISTS idx_audit_ts ON audit(ts);",
+        CREATE INDEX IF NOT EXISTS idx_audit_ts ON audit(ts);
+        -- 一次性安装令牌：默认 15 分钟、单次使用。
+        -- 明文入库是可接受的简化（短 TTL + 单次消费 + 仅管理员可创建）
+        CREATE TABLE IF NOT EXISTS enroll_tokens (
+            token TEXT PRIMARY KEY,
+            note TEXT NOT NULL DEFAULT '',
+            created_at INTEGER NOT NULL,
+            expires_at INTEGER NOT NULL,
+            max_uses INTEGER NOT NULL DEFAULT 1,
+            used_count INTEGER NOT NULL DEFAULT 0,
+            used_at INTEGER,
+            used_ip TEXT
+        );
+        -- 操作员 SSH 公钥：按 controller_id 归属，下发时只按有效 grant 过滤
+        CREATE TABLE IF NOT EXISTS ssh_keys (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            controller_id TEXT NOT NULL,
+            pubkey TEXT NOT NULL,
+            comment TEXT NOT NULL DEFAULT '',
+            created_at INTEGER NOT NULL,
+            revoked INTEGER NOT NULL DEFAULT 0
+        );
+        CREATE INDEX IF NOT EXISTS idx_ssh_keys_ctrl ON ssh_keys(controller_id);",
     )?;
     // 旧库升级：SQLite 的 ADD COLUMN 不支持 IF NOT EXISTS，按 PRAGMA 结果补齐
     let existing: std::collections::HashSet<String> = {
@@ -392,6 +421,125 @@ fn current_peers(conn: &Connection, id: &str, role: Role, now: u64) -> Vec<Strin
         .query_map(rusqlite::params![id, now], |r| r.get::<_, String>(0))
         .unwrap();
     rows.filter_map(|r| r.ok()).collect()
+}
+
+// ============================================================
+// 一键安装 / 公钥下发 辅助
+// ============================================================
+/// 32 字节随机 hex（安装令牌）
+fn random_hex(bytes: usize) -> String {
+    use rand::RngCore;
+    let mut buf = vec![0u8; bytes];
+    rand::rngs::OsRng.fill_bytes(&mut buf);
+    buf.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// 把 `--public-url` 归一化为 (HTTP 基址, WS 地址)。
+/// 接受 http(s):// / ws(s):// / 裸 host 三种写法，尾部 /ws 自动补齐或剥离。
+fn normalize_public_url(raw: &str) -> Option<(String, String)> {
+    let s = raw.trim().trim_end_matches('/');
+    if s.is_empty() {
+        return None;
+    }
+    let (http, ws) = if let Some(rest) = s.strip_prefix("wss://") {
+        (format!("https://{rest}"), format!("wss://{rest}"))
+    } else if let Some(rest) = s.strip_prefix("ws://") {
+        (format!("http://{rest}"), format!("ws://{rest}"))
+    } else if s.starts_with("https://") {
+        (s.to_string(), s.replacen("https://", "wss://", 1))
+    } else if s.starts_with("http://") {
+        (s.to_string(), s.replacen("http://", "ws://", 1))
+    } else {
+        (format!("http://{s}"), format!("ws://{s}"))
+    };
+    let http = http.trim_end_matches("/ws").trim_end_matches('/').to_string();
+    let ws = ws.trim_end_matches('/').to_string();
+    let ws = if ws.ends_with("/ws") {
+        ws
+    } else {
+        format!("{ws}/ws")
+    };
+    Some((http, ws))
+}
+
+/// 对外基址：优先 `--public-url`，否则按反向代理头推导
+fn public_bases(state: &AppState, headers: &HeaderMap) -> (String, String) {
+    if let Some(v) = normalize_public_url(&state.public_url) {
+        return v;
+    }
+    let host = headers
+        .get("host")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("127.0.0.1:8088")
+        .to_string();
+    let proto = headers
+        .get("x-forwarded-proto")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.split(',').next())
+        .map(|v| v.trim())
+        .filter(|v| !v.is_empty())
+        .unwrap_or("http");
+    let http = format!("{proto}://{host}");
+    let ws = format!(
+        "{}://{host}/ws",
+        if proto == "https" { "wss" } else { "ws" }
+    );
+    (http, ws)
+}
+
+/// 真实客户端 IP（Caddy 反代时取 X-Forwarded-For 首个）
+fn client_ip(headers: &HeaderMap) -> String {
+    headers
+        .get("x-forwarded-for")
+        .or_else(|| headers.get("x-real-ip"))
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.split(',').next())
+        .map(|v| v.trim().to_string())
+        .unwrap_or_default()
+}
+
+/// 校验 ed25519 分离签名（公钥/签名均为 Base64）
+fn verify_ed25519(pubkey_b64: &str, msg: &[u8], sig_b64: &str) -> bool {
+    use base64::Engine as _;
+    use ed25519_dalek::{Signature, Verifier, VerifyingKey};
+    let b64 = base64::engine::general_purpose::STANDARD;
+    let (Ok(pk), Ok(sig)) = (b64.decode(pubkey_b64), b64.decode(sig_b64)) else {
+        return false;
+    };
+    let (Ok(pk), Ok(sig)): (Result<[u8; 32], _>, Result<[u8; 64], _>) =
+        (pk.try_into(), sig.try_into())
+    else {
+        return false;
+    };
+    match VerifyingKey::from_bytes(&pk) {
+        Ok(vk) => vk.verify(msg, &Signature::from_bytes(&sig)).is_ok(),
+        Err(_) => false,
+    }
+}
+
+/// OpenSSH 公钥行基本格式校验（单行、已知算法、长度上限）
+fn validate_ssh_pubkey(pubkey: &str) -> Result<(), String> {
+    let p = pubkey.trim();
+    if p.is_empty() || p.len() > 4096 {
+        return Err("公钥为空或过长".into());
+    }
+    if p.contains('\n') || p.contains('\r') {
+        return Err("公钥必须为单行".into());
+    }
+    const ALGS: &[&str] = &[
+        "ssh-ed25519 ",
+        "ssh-rsa ",
+        "ecdsa-sha2-",
+        "sk-ssh-ed25519@openssh.com ",
+        "sk-ecdsa-sha2-",
+    ];
+    if !ALGS.iter().any(|a| p.starts_with(a)) {
+        return Err("公钥算法不支持（需 ssh-ed25519 / ssh-rsa / ecdsa）".into());
+    }
+    if p.split_whitespace().count() < 2 {
+        return Err("公钥格式不完整".into());
+    }
+    Ok(())
 }
 
 // ============================================================
@@ -1147,6 +1295,498 @@ async fn api_updater_manifest(State(state): State<AppState>) -> Response {
 }
 
 // ============================================================
+// 一键安装 / 公钥下发（公开路由，不走 Basic Auth）
+// ============================================================
+const INSTALL_PS1: &str = include_str!("../web/install.ps1");
+
+fn unauthorized(msg: &str) -> Response {
+    (StatusCode::UNAUTHORIZED, msg.to_string()).into_response()
+}
+
+/// 百分号编码路径段（安装包文件名可能含空格/中文）
+fn percent_encode_path(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.as_bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(*b as char)
+            }
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
+}
+
+/// 令牌可用性检查（不消费）：不存在 404、过期/用尽 410
+fn token_usable(conn: &Connection, token: &str, now: i64) -> Result<(), (StatusCode, String)> {
+    let row: Option<(i64, i64, i64)> = conn
+        .query_row(
+            "SELECT expires_at, max_uses, used_count FROM enroll_tokens WHERE token=?1",
+            rusqlite::params![token],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .ok();
+    match row {
+        None => Err((StatusCode::NOT_FOUND, "安装令牌不存在".into())),
+        Some((exp, _, _)) if exp <= now => Err((StatusCode::GONE, "安装令牌已过期".into())),
+        Some((_, max, used)) if used >= max => Err((StatusCode::GONE, "安装令牌已用完".into())),
+        _ => Ok(()),
+    }
+}
+
+/// 分配不与现有设备冲突的 9 位数字 ID
+fn alloc_device_id(conn: &Connection) -> Option<String> {
+    use rand::RngCore;
+    for _ in 0..16 {
+        let mut b = [0u8; 4];
+        rand::rngs::OsRng.fill_bytes(&mut b);
+        let n = 100_000_000u64 + (u32::from_le_bytes(b) as u64 % 900_000_000);
+        let id = n.to_string();
+        let exists: bool = conn
+            .query_row("SELECT 1 FROM devices WHERE id=?1", rusqlite::params![id], |_| {
+                Ok::<_, rusqlite::Error>(true)
+            })
+            .unwrap_or(false);
+        if !exists {
+            return Some(id);
+        }
+    }
+    None
+}
+
+#[derive(Deserialize)]
+struct TokenQuery {
+    token: String,
+}
+
+/// GET /bootstrap/install.ps1?token=…：返回带服务器地址与令牌的安装脚本
+async fn bootstrap_install_ps1(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(q): Query<TokenQuery>,
+) -> Response {
+    let now = now_epoch() as i64;
+    {
+        let conn = state.db.lock();
+        if let Err((code, msg)) = token_usable(&conn, &q.token, now) {
+            return (code, msg).into_response();
+        }
+    }
+    let (http, _) = public_bases(&state, &headers);
+    let script = INSTALL_PS1
+        .replace("__BASE__", &http)
+        .replace("__TOKEN__", q.token.trim());
+    Response::builder()
+        .header("content-type", "text/plain; charset=utf-8")
+        .header("cache-control", "no-store")
+        .body(Body::from(script))
+        .unwrap()
+}
+
+#[derive(Deserialize)]
+struct ClaimReq {
+    token: String,
+    #[serde(default)]
+    hostname: Option<String>,
+}
+
+/// POST /bootstrap/claim：消耗一次性令牌并分配设备 ID
+async fn bootstrap_claim(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(req): Json<ClaimReq>,
+) -> Response {
+    let now = now_epoch() as i64;
+    let ip = client_ip(&headers);
+    let (http, ws) = public_bases(&state, &headers);
+    let device_id = {
+        let conn = state.db.lock();
+        // 原子消费：条件更新，影响行数为 0 说明过期/用尽/不存在
+        let n = conn
+            .execute(
+                "UPDATE enroll_tokens SET used_count=used_count+1, used_at=?2, used_ip=?3
+                 WHERE token=?1 AND used_count < max_uses AND expires_at > ?2",
+                rusqlite::params![req.token.trim(), now, ip],
+            )
+            .unwrap_or(0);
+        if n == 0 {
+            return match token_usable(&conn, req.token.trim(), now) {
+                Err((code, msg)) => (code, msg).into_response(),
+                Ok(()) => (StatusCode::GONE, "安装令牌已用完").into_response(),
+            };
+        }
+        let Some(id) = alloc_device_id(&conn) else {
+            return bad("设备 ID 分配失败，请重试");
+        };
+        let hostname = req.hostname.unwrap_or_default();
+        if let Err(e) = conn.execute(
+            "INSERT INTO devices(id, role, hostname, busy, created_at, last_seen)
+             VALUES(?1,'controlled',?2,0,?3,0)",
+            rusqlite::params![id, hostname, now],
+        ) {
+            return bad(e.to_string());
+        }
+        id
+    };
+    audit(
+        &state,
+        "enroll_claim",
+        "bootstrap",
+        &device_id,
+        &format!("ip={ip}"),
+    );
+    ok_json(serde_json::json!({
+        "ok": true,
+        "device_id": device_id,
+        "server": ws,
+        "base": http,
+    }))
+}
+
+/// GET /bootstrap/agent?token=…：返回 packages_dir 中最新的 Agent 安装包地址
+async fn bootstrap_agent(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(q): Query<TokenQuery>,
+) -> Response {
+    let now = now_epoch() as i64;
+    {
+        let conn = state.db.lock();
+        if let Err((code, msg)) = token_usable(&conn, &q.token, now) {
+            return (code, msg).into_response();
+        }
+    }
+    let mut best: Option<(String, u64, i64)> = None;
+    if let Ok(mut rd) = tokio::fs::read_dir(state.packages_dir.as_str()).await {
+        while let Ok(Some(e)) = rd.next_entry().await {
+            let name = e.file_name().to_string_lossy().to_string();
+            let lower = name.to_ascii_lowercase();
+            if !lower.ends_with(".exe") || !lower.contains("rebleach") || !lower.contains("agent") {
+                continue;
+            }
+            let Ok(md) = e.metadata().await else { continue };
+            if !md.is_file() {
+                continue;
+            }
+            let mtime = md
+                .modified()
+                .ok()
+                .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+                .map(|d| d.as_secs() as i64)
+                .unwrap_or(0);
+            if best.as_ref().map(|(_, _, m)| mtime > *m).unwrap_or(true) {
+                best = Some((name, md.len(), mtime));
+            }
+        }
+    }
+    let Some((name, size, _)) = best else {
+        return (
+            StatusCode::NOT_FOUND,
+            "服务器 packages 目录下还没有 Rebleach Agent 安装包",
+        )
+            .into_response();
+    };
+    let (http, _) = public_bases(&state, &headers);
+    let url = format!(
+        "{http}/api/v1/updater/download/{}",
+        percent_encode_path(&name)
+    );
+    ok_json(serde_json::json!({
+        "ok": true,
+        "name": name,
+        "size": size,
+        "url": url,
+    }))
+}
+
+#[derive(Deserialize)]
+struct AgentKeysQuery {
+    id: String,
+    ts: i64,
+    sig: String,
+}
+
+/// GET /agent/ssh-keys?id=&ts=&sig=：被控端凭设备私钥签名拉取授权公钥。
+/// 只返回「当前存在有效 grant 的主控端」登记的公钥，撤销授权后自动失效。
+async fn agent_ssh_keys(
+    State(state): State<AppState>,
+    Query(q): Query<AgentKeysQuery>,
+) -> Response {
+    let now = now_epoch() as i64;
+    if (now - q.ts).abs() > 300 {
+        return unauthorized("timestamp out of range");
+    }
+    let msg = format!("rebleach-agent-keys\n{}\n{}", q.id, q.ts);
+    let keys: Vec<serde_json::Value> = {
+        let conn = state.db.lock();
+        let pk: Option<String> = conn
+            .query_row(
+                "SELECT pubkey FROM devices WHERE id=?1",
+                rusqlite::params![q.id],
+                |r| r.get::<_, Option<String>>(0),
+            )
+            .ok()
+            .flatten();
+        let Some(pk) = pk.filter(|p| !p.is_empty()) else {
+            return unauthorized("unknown device");
+        };
+        if !verify_ed25519(&pk, msg.as_bytes(), &q.sig) {
+            return unauthorized("bad signature");
+        }
+        let Ok(mut stmt) = conn.prepare(
+            "SELECT DISTINCT k.pubkey, k.comment
+             FROM ssh_keys k
+             JOIN grants g ON g.controller_id = k.controller_id
+             WHERE g.controlled_id = ?1 AND k.revoked = 0 AND g.revoked = 0
+               AND g.start_at <= ?2 AND g.end_at > ?2",
+        ) else {
+            return (StatusCode::INTERNAL_SERVER_ERROR, "db error").into_response();
+        };
+        stmt.query_map(rusqlite::params![q.id, now], |r| {
+            Ok(serde_json::json!({
+                "pubkey": r.get::<_, String>(0)?,
+                "comment": r.get::<_, String>(1)?,
+            }))
+        })
+        .map(|rows| rows.filter_map(|r| r.ok()).collect())
+        .unwrap_or_default()
+    };
+    ok_json(serde_json::json!({
+        "ok": true,
+        "server_time": now,
+        "keys": keys,
+    }))
+}
+
+// ---------- 安装令牌（管理端） ----------
+#[derive(Deserialize)]
+struct EnrollTokenCreate {
+    #[serde(default)]
+    note: Option<String>,
+    #[serde(default)]
+    ttl_secs: Option<u64>,
+}
+
+async fn api_enroll_tokens_create(
+    State(state): State<AppState>,
+    Json(req): Json<EnrollTokenCreate>,
+) -> Response {
+    let ttl = req.ttl_secs.unwrap_or(900).clamp(60, 86_400) as i64;
+    let now = now_epoch() as i64;
+    let expires = now + ttl;
+    let token = random_hex(32);
+    let note = req.note.unwrap_or_default();
+    {
+        let conn = state.db.lock();
+        if let Err(e) = conn.execute(
+            "INSERT INTO enroll_tokens(token, note, created_at, expires_at, max_uses, used_count)
+             VALUES(?1,?2,?3,?4,1,0)",
+            rusqlite::params![token, note, now, expires],
+        ) {
+            return bad(e.to_string());
+        }
+    }
+    audit(
+        &state,
+        "enroll_token_create",
+        "admin",
+        "",
+        &format!("ttl={ttl}s note={note}"),
+    );
+    ok_json(serde_json::json!({
+        "ok": true,
+        "token": token,
+        "expires_at": expires,
+        "ttl_secs": ttl,
+    }))
+}
+
+async fn api_enroll_tokens_list(State(state): State<AppState>) -> Response {
+    let now = now_epoch() as i64;
+    let rows: Vec<serde_json::Value> = {
+        let conn = state.db.lock();
+        let Ok(mut stmt) = conn.prepare(
+            "SELECT token, note, created_at, expires_at, max_uses, used_count, used_at, used_ip
+             FROM enroll_tokens ORDER BY created_at DESC LIMIT 200",
+        ) else {
+            return (StatusCode::INTERNAL_SERVER_ERROR, "db error").into_response();
+        };
+        stmt.query_map([], |r| {
+            let expires: i64 = r.get(3)?;
+            let used: i64 = r.get(5)?;
+            let max: i64 = r.get(4)?;
+            let status = if used >= max {
+                "used"
+            } else if expires <= now {
+                "expired"
+            } else {
+                "active"
+            };
+            Ok(serde_json::json!({
+                "token": r.get::<_, String>(0)?,
+                "note": r.get::<_, String>(1)?,
+                "created_at": r.get::<_, i64>(2)?,
+                "expires_at": expires,
+                "max_uses": max,
+                "used_count": used,
+                "used_at": r.get::<_, Option<i64>>(6)?,
+                "used_ip": r.get::<_, Option<String>>(7)?,
+                "status": status,
+            }))
+        })
+        .map(|rows| rows.filter_map(|r| r.ok()).collect())
+        .unwrap_or_default()
+    };
+    ok_json(serde_json::json!({"ok": true, "data": rows}))
+}
+
+/// DELETE /api/v1/enroll-tokens/{token}：作废未使用的安装令牌
+async fn api_enroll_tokens_revoke(
+    State(state): State<AppState>,
+    Path(token): Path<String>,
+) -> Response {
+    let deleted = {
+        let conn = state.db.lock();
+        conn.execute(
+            "DELETE FROM enroll_tokens WHERE token=?1 AND used_count=0",
+            rusqlite::params![token],
+        )
+        .unwrap_or(0)
+    };
+    if deleted == 0 {
+        return (StatusCode::NOT_FOUND, "令牌不存在或已被使用").into_response();
+    }
+    let short: String = token.chars().take(10).collect();
+    audit(
+        &state,
+        "enroll_token_revoke",
+        "admin",
+        "",
+        &format!("token={short}…"),
+    );
+    ok_json(serde_json::json!({"ok": true}))
+}
+
+// ---------- 操作员 SSH 公钥（管理端） ----------
+#[derive(Deserialize)]
+struct SshKeyCreate {
+    controller_id: String,
+    pubkey: String,
+    #[serde(default)]
+    comment: Option<String>,
+}
+
+async fn api_ssh_keys_create(
+    State(state): State<AppState>,
+    Json(req): Json<SshKeyCreate>,
+) -> Response {
+    if let Err(e) = validate_device_id(&req.controller_id, "主控端 ID") {
+        return bad(e);
+    }
+    let pubkey = req.pubkey.trim().to_string();
+    if let Err(e) = validate_ssh_pubkey(&pubkey) {
+        return bad(e);
+    }
+    let now = now_epoch() as i64;
+    // comment 默认取公钥行第三段
+    let comment = req.comment.unwrap_or_else(|| {
+        pubkey
+            .split_whitespace()
+            .nth(2)
+            .unwrap_or("")
+            .to_string()
+    });
+    let id = {
+        let conn = state.db.lock();
+        // 幂等：同一主控端重复登记同一把公钥时直接返回既有记录
+        let existing: Option<i64> = conn
+            .query_row(
+                "SELECT id FROM ssh_keys WHERE controller_id=?1 AND pubkey=?2 AND revoked=0 LIMIT 1",
+                rusqlite::params![req.controller_id, pubkey],
+                |r| r.get(0),
+            )
+            .ok();
+        if let Some(id) = existing {
+            return ok_json(serde_json::json!({"ok": true, "id": id, "duplicated": true}));
+        }
+        match conn.execute(
+            "INSERT INTO ssh_keys(controller_id, pubkey, comment, created_at, revoked)
+             VALUES(?1,?2,?3,?4,0)",
+            rusqlite::params![req.controller_id, pubkey, comment, now],
+        ) {
+            Ok(_) => conn.last_insert_rowid(),
+            Err(e) => return bad(e.to_string()),
+        }
+    };
+    audit(
+        &state,
+        "ssh_key_register",
+        &req.controller_id,
+        "",
+        &format!("key #{id}"),
+    );
+    ok_json(serde_json::json!({"ok": true, "id": id, "duplicated": false}))
+}
+
+#[derive(Deserialize)]
+struct SshKeyQuery {
+    #[serde(default)]
+    controller_id: Option<String>,
+}
+
+async fn api_ssh_keys_list(
+    State(state): State<AppState>,
+    Query(q): Query<SshKeyQuery>,
+) -> Response {
+    let rows: Vec<serde_json::Value> = {
+        fn row_to_json(r: &rusqlite::Row<'_>) -> rusqlite::Result<serde_json::Value> {
+            Ok(serde_json::json!({
+                "id": r.get::<_, i64>(0)?,
+                "controller_id": r.get::<_, String>(1)?,
+                "pubkey": r.get::<_, String>(2)?,
+                "comment": r.get::<_, String>(3)?,
+                "created_at": r.get::<_, i64>(4)?,
+                "revoked": r.get::<_, i64>(5)? != 0,
+            }))
+        }
+        let conn = state.db.lock();
+        let sql = if q.controller_id.is_some() {
+            "SELECT id, controller_id, pubkey, comment, created_at, revoked FROM ssh_keys
+             WHERE controller_id=?1 ORDER BY id DESC LIMIT 500"
+        } else {
+            "SELECT id, controller_id, pubkey, comment, created_at, revoked FROM ssh_keys
+             ORDER BY id DESC LIMIT 500"
+        };
+        let Ok(mut stmt) = conn.prepare(sql) else {
+            return (StatusCode::INTERNAL_SERVER_ERROR, "db error").into_response();
+        };
+        match q.controller_id {
+            Some(cid) => stmt
+                .query_map(rusqlite::params![cid], row_to_json)
+                .map(|rows| rows.filter_map(|r| r.ok()).collect())
+                .unwrap_or_default(),
+            None => stmt
+                .query_map([], row_to_json)
+                .map(|rows| rows.filter_map(|r| r.ok()).collect())
+                .unwrap_or_default(),
+        }
+    };
+    ok_json(serde_json::json!({"ok": true, "data": rows}))
+}
+
+async fn api_ssh_keys_revoke(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+) -> Response {
+    {
+        let conn = state.db.lock();
+        let _ = conn.execute("UPDATE ssh_keys SET revoked=1 WHERE id=?1", [id]);
+    }
+    audit(&state, "ssh_key_revoke", "admin", "", &format!("key #{id}"));
+    ok_json(serde_json::json!({"ok": true}))
+}
+
+// ============================================================
 // 管理端网页（内嵌静态页，复用 Basic Auth）
 // ============================================================
 async fn admin_root() -> Response {
@@ -1164,6 +1804,7 @@ admin_page!(page_devices, "../web/devices.html");
 admin_page!(page_grants, "../web/grants.html");
 admin_page!(page_packages, "../web/packages.html");
 admin_page!(page_audit, "../web/audit.html");
+admin_page!(page_access, "../web/access.html");
 
 // ============================================================
 // Basic Auth 中间件（仅保护 /api/v1/*）
@@ -1223,6 +1864,7 @@ async fn main() -> Result<()> {
         admin: Arc::new((cli.admin_user, cli.admin_pass)),
         packages_dir: Arc::new(cli.packages_dir),
         turn: Arc::new((cli.turn_url, cli.turn_secret, cli.turn_ttl)),
+        public_url: Arc::new(cli.public_url),
     };
 
     // 窗口到期扫描任务：每 1s 找出过期 grant，主动驱逐两端
@@ -1303,6 +1945,19 @@ fn build_app(state: AppState) -> Router {
         .route("/audit", get(api_audit))
         .route("/packages", get(api_packages_list))
         .route("/packages/{name}", get(api_package_download))
+        .route(
+            "/enroll-tokens",
+            post(api_enroll_tokens_create).get(api_enroll_tokens_list),
+        )
+        .route(
+            "/enroll-tokens/{token}",
+            axum::routing::delete(api_enroll_tokens_revoke),
+        )
+        .route(
+            "/ssh-keys",
+            post(api_ssh_keys_create).get(api_ssh_keys_list),
+        )
+        .route("/ssh-keys/{id}", axum::routing::delete(api_ssh_keys_revoke))
         .layer(middleware::from_fn_with_state(
             state.clone(),
             admin_middleware,
@@ -1315,6 +1970,7 @@ fn build_app(state: AppState) -> Router {
         .route("/grants", get(page_grants))
         .route("/packages", get(page_packages))
         .route("/audit", get(page_audit))
+        .route("/access", get(page_access))
         .layer(middleware::from_fn_with_state(
             state.clone(),
             admin_middleware,
@@ -1323,6 +1979,11 @@ fn build_app(state: AppState) -> Router {
     Router::new()
         .route("/ws", get(ws_upgrade))
         .route("/health", get(health))
+        // 一键安装与设备公钥拉取：公开访问（令牌/设备签名自校验）
+        .route("/bootstrap/install.ps1", get(bootstrap_install_ps1))
+        .route("/bootstrap/claim", post(bootstrap_claim))
+        .route("/bootstrap/agent", get(bootstrap_agent))
+        .route("/agent/ssh-keys", get(agent_ssh_keys))
         // 自动更新：公开访问（包完整性由 minisign 签名校验，无需 Basic Auth）
         .route("/api/v1/updater/latest.json", get(api_updater_manifest))
         .route("/api/v1/updater/download/{name}", get(api_package_download))
@@ -1354,6 +2015,7 @@ mod tests {
             admin: Arc::new(("admin".to_string(), "secret".to_string())),
             packages_dir: Arc::new(tmp.to_string_lossy().to_string()),
             turn: Arc::new((String::new(), String::new(), 0)),
+            public_url: Arc::new(String::new()),
         }
     }
 
@@ -1376,6 +2038,24 @@ mod tests {
     async fn get(state: AppState, path: &str, auth: bool) -> (StatusCode, Vec<u8>) {
         let app = build_app(state);
         let mut req = Request::builder().uri(path).method("GET");
+        if auth {
+            req = req.header("authorization", basic_auth_header());
+        }
+        let resp = app.oneshot(req.body(Body::empty()).unwrap()).await.unwrap();
+        let status = resp.status();
+        let bytes = resp
+            .into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes()
+            .to_vec();
+        (status, bytes)
+    }
+
+    async fn delete(state: AppState, path: &str, auth: bool) -> (StatusCode, Vec<u8>) {
+        let app = build_app(state);
+        let mut req = Request::builder().uri(path).method("DELETE");
         if auth {
             req = req.header("authorization", basic_auth_header());
         }
@@ -1554,5 +2234,306 @@ mod tests {
         assert_eq!(status, StatusCode::OK);
         let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(v["version"], "1.0.0");
+    }
+
+    // ---------- 一键安装 / 公钥下发 ----------
+
+    async fn create_token(state: &AppState) -> String {
+        let body = serde_json::json!({"note": "test", "ttl_secs": 900}).to_string();
+        let (status, resp) = post_json(state.clone(), "/api/v1/enroll-tokens", &body, true).await;
+        assert_eq!(status, StatusCode::OK);
+        let v: serde_json::Value = serde_json::from_slice(&resp).unwrap();
+        v["token"].as_str().unwrap().to_string()
+    }
+
+    fn keys_signed_path(sk: &ed25519_dalek::SigningKey, id: &str, ts: i64) -> String {
+        use base64::Engine as _;
+        use ed25519_dalek::Signer as _;
+        let msg = format!("rebleach-agent-keys\n{id}\n{ts}");
+        let sig =
+            base64::engine::general_purpose::STANDARD.encode(sk.sign(msg.as_bytes()).to_bytes());
+        format!(
+            "/agent/ssh-keys?id={id}&ts={ts}&sig={}",
+            percent_encode_path(&sig)
+        )
+    }
+
+    #[tokio::test]
+    async fn enroll_tokens_requires_auth() {
+        let (status, _) = get(test_state(), "/api/v1/enroll-tokens", false).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn enroll_token_single_use_allocates_device() {
+        let state = test_state();
+        let token = create_token(&state).await;
+        let body = serde_json::json!({"token": token, "hostname": "pc-test"}).to_string();
+
+        let (status, resp) = post_json(state.clone(), "/bootstrap/claim", &body, false).await;
+        assert_eq!(status, StatusCode::OK);
+        let v: serde_json::Value = serde_json::from_slice(&resp).unwrap();
+        let id = v["device_id"].as_str().unwrap().to_string();
+        assert_eq!(id.len(), 9);
+        assert!(id.chars().all(|c| c.is_ascii_digit()));
+        assert!(v["server"].as_str().unwrap().ends_with("/ws"));
+
+        // 设备已入库，且角色为 controlled（授权创建的前置条件）
+        let row: (String, String) = {
+            let conn = state.db.lock();
+            conn.query_row(
+                "SELECT role, hostname FROM devices WHERE id=?1",
+                rusqlite::params![id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap()
+        };
+        assert_eq!(row.0, "controlled");
+        assert_eq!(row.1, "pc-test");
+
+        // 第二次使用同一令牌 → 410
+        let (status, _) = post_json(state, "/bootstrap/claim", &body, false).await;
+        assert_eq!(status, StatusCode::GONE);
+    }
+
+    #[tokio::test]
+    async fn enroll_token_expired_returns_410() {
+        let state = test_state();
+        let token = "deadbeef".to_string();
+        {
+            let conn = state.db.lock();
+            conn.execute(
+                "INSERT INTO enroll_tokens(token, note, created_at, expires_at, max_uses, used_count)
+                 VALUES(?1,'expired',0,1,1,0)",
+                rusqlite::params![token],
+            )
+            .unwrap();
+        }
+        let body = serde_json::json!({"token": token}).to_string();
+        let (status, _) = post_json(state.clone(), "/bootstrap/claim", &body, false).await;
+        assert_eq!(status, StatusCode::GONE);
+
+        let (status, _) = get(
+            state,
+            &format!("/bootstrap/install.ps1?token={token}"),
+            false,
+        )
+        .await;
+        assert_eq!(status, StatusCode::GONE);
+    }
+
+    #[tokio::test]
+    async fn bootstrap_install_script_renders_server() {
+        let state = test_state();
+        let token = create_token(&state).await;
+        let (status, body) = get(
+            state,
+            &format!("/bootstrap/install.ps1?token={token}"),
+            false,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let text = String::from_utf8_lossy(&body);
+        assert!(!text.contains("__BASE__"));
+        assert!(!text.contains("__TOKEN__"));
+        assert!(text.contains(&token));
+        assert!(text.contains("bootstrap/claim"));
+    }
+
+    #[tokio::test]
+    async fn agent_ssh_keys_rejects_bad_signature() {
+        use base64::Engine as _;
+        let state = test_state();
+        let sk = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
+        let pk = base64::engine::general_purpose::STANDARD.encode(sk.verifying_key().to_bytes());
+        {
+            let conn = state.db.lock();
+            conn.execute(
+                "INSERT INTO devices(id, role, pubkey, created_at, last_seen)
+                 VALUES('200000002','controlled',?1,0,0)",
+                rusqlite::params![pk],
+            )
+            .unwrap();
+        }
+        let now = now_epoch() as i64;
+
+        // 签名错误
+        let bad = format!(
+            "/agent/ssh-keys?id=200000002&ts={now}&sig={}",
+            percent_encode_path("AAAA")
+        );
+        let (status, _) = get(state.clone(), &bad, false).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+        // 时间戳漂移超过 300 秒
+        let stale = keys_signed_path(&sk, "200000002", now - 1000);
+        let (status, _) = get(state.clone(), &stale, false).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+        // 正确签名但无 grant → 公钥列表为空
+        let ok = keys_signed_path(&sk, "200000002", now);
+        let (status, resp) = get(state, &ok, false).await;
+        assert_eq!(status, StatusCode::OK);
+        let v: serde_json::Value = serde_json::from_slice(&resp).unwrap();
+        assert!(v["keys"].as_array().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn agent_ssh_keys_filtered_by_active_grant() {
+        use base64::Engine as _;
+        let state = test_state();
+        let sk = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
+        let pk = base64::engine::general_purpose::STANDARD.encode(sk.verifying_key().to_bytes());
+        {
+            let conn = state.db.lock();
+            conn.execute(
+                "INSERT INTO devices(id, role, pubkey, created_at, last_seen)
+                 VALUES('200000002','controlled',?1,0,0)",
+                rusqlite::params![pk],
+            )
+            .unwrap();
+        }
+        // 登记主控端公钥
+        let key_body = serde_json::json!({
+            "controller_id": "100000001",
+            "pubkey": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAITESTKEY operator@test"
+        })
+        .to_string();
+        let (status, _) = post_json(state.clone(), "/api/v1/ssh-keys", &key_body, true).await;
+        assert_eq!(status, StatusCode::OK);
+
+        // 无授权 → 空
+        let now = now_epoch() as i64;
+        let path = keys_signed_path(&sk, "200000002", now);
+        let (_, resp) = get(state.clone(), &path, false).await;
+        let v: serde_json::Value = serde_json::from_slice(&resp).unwrap();
+        assert!(v["keys"].as_array().unwrap().is_empty());
+
+        // 建授权 → 有值
+        let grant = serde_json::json!({
+            "controller_id": "100000001",
+            "controlled_id": "200000002",
+            "duration_secs": 3600
+        })
+        .to_string();
+        let (status, resp) = post_json(state.clone(), "/api/v1/grants", &grant, true).await;
+        assert_eq!(status, StatusCode::OK);
+        let grant_id = serde_json::from_slice::<serde_json::Value>(&resp).unwrap()["id"]
+            .as_i64()
+            .unwrap();
+
+        let (status, resp) = get(state.clone(), &path, false).await;
+        assert_eq!(status, StatusCode::OK);
+        let v: serde_json::Value = serde_json::from_slice(&resp).unwrap();
+        let keys = v["keys"].as_array().unwrap();
+        assert_eq!(keys.len(), 1);
+        assert!(keys[0]["pubkey"].as_str().unwrap().starts_with("ssh-ed25519 "));
+
+        // 撤销授权 → 公钥立即消失
+        let (status, _) = delete(state.clone(), &format!("/api/v1/grants/{grant_id}"), true).await;
+        assert_eq!(status, StatusCode::OK);
+        let (_, resp) = get(state, &path, false).await;
+        let v: serde_json::Value = serde_json::from_slice(&resp).unwrap();
+        assert!(v["keys"].as_array().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn ssh_keys_register_list_revoke() {
+        let state = test_state();
+        let body = serde_json::json!({
+            "controller_id": "100000001",
+            "pubkey": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOPERATORKEY a@b"
+        })
+        .to_string();
+        let (status, resp) = post_json(state.clone(), "/api/v1/ssh-keys", &body, true).await;
+        assert_eq!(status, StatusCode::OK);
+        let v: serde_json::Value = serde_json::from_slice(&resp).unwrap();
+        let id = v["id"].as_i64().unwrap();
+        assert_eq!(v["duplicated"], false);
+
+        // 重复登记幂等
+        let (_, resp) = post_json(state.clone(), "/api/v1/ssh-keys", &body, true).await;
+        let v: serde_json::Value = serde_json::from_slice(&resp).unwrap();
+        assert_eq!(v["id"].as_i64().unwrap(), id);
+        assert_eq!(v["duplicated"], true);
+
+        let (status, resp) = get(state.clone(), "/api/v1/ssh-keys", true).await;
+        assert_eq!(status, StatusCode::OK);
+        let v: serde_json::Value = serde_json::from_slice(&resp).unwrap();
+        assert_eq!(v["data"].as_array().unwrap().len(), 1);
+        assert_eq!(v["data"][0]["comment"], "a@b");
+
+        let (status, _) = delete(state.clone(), &format!("/api/v1/ssh-keys/{id}"), true).await;
+        assert_eq!(status, StatusCode::OK);
+        let (_, resp) = get(state, "/api/v1/ssh-keys", true).await;
+        let v: serde_json::Value = serde_json::from_slice(&resp).unwrap();
+        assert_eq!(v["data"][0]["revoked"], true);
+    }
+
+    #[tokio::test]
+    async fn ssh_keys_rejects_invalid_pubkey() {
+        let state = test_state();
+        let body = serde_json::json!({
+            "controller_id": "100000001",
+            "pubkey": "not-a-key\nssh-ed25519 AAAA x"
+        })
+        .to_string();
+        let (status, _) = post_json(state, "/api/v1/ssh-keys", &body, true).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn admin_access_page_requires_auth() {
+        let state = test_state();
+        let (status, _) = get(state.clone(), "/admin/access", false).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+        let (status, body) = get(state, "/admin/access", true).await;
+        assert_eq!(status, StatusCode::OK);
+        let html = String::from_utf8_lossy(&body);
+        assert!(html.contains("接入配置"));
+        assert!(html.contains("/bootstrap/install.ps1"));
+        assert!(html.contains("/api/v1/ssh-keys"));
+    }
+
+    #[tokio::test]
+    async fn enroll_token_revoke_unused() {
+        let state = test_state();
+        let token = create_token(&state).await;
+        let (status, _) = delete(
+            state.clone(),
+            &format!("/api/v1/enroll-tokens/{token}"),
+            true,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+
+        // 作废后令牌不存在 → claim 404
+        let body = serde_json::json!({"token": token}).to_string();
+        let (status, _) = post_json(state, "/bootstrap/claim", &body, false).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn enroll_token_revoke_used_rejected() {
+        let state = test_state();
+        let token = create_token(&state).await;
+        let body = serde_json::json!({"token": token}).to_string();
+        let (status, _) = post_json(state.clone(), "/bootstrap/claim", &body, false).await;
+        assert_eq!(status, StatusCode::OK);
+
+        // 已使用的令牌不允许作废，记录保留
+        let (status, _) = delete(
+            state.clone(),
+            &format!("/api/v1/enroll-tokens/{token}"),
+            true,
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+
+        let (_, resp) = get(state, "/api/v1/enroll-tokens", true).await;
+        let v: serde_json::Value = serde_json::from_slice(&resp).unwrap();
+        assert_eq!(v["data"].as_array().unwrap().len(), 1);
+        assert_eq!(v["data"][0]["status"], "used");
     }
 }

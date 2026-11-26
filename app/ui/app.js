@@ -31,6 +31,12 @@ const state = {
   clipOn: true,
   fullscreen: false,
   ctl: null, // 主控端配置 { id, nodes, active }
+  monitors: [], // 被控端显示器清单（含虚拟桌面原点，用于跨屏拖拽）
+  curMonitor: -1, // 当前正在观看的显示器索引
+  buttons: new Set(), // 当前按下的鼠标键（拖拽时改用绝对坐标）
+  dragging: false,
+  switchPending: false,
+  link: null,
 };
 
 // ============================================================
@@ -41,6 +47,7 @@ const LS = {
   fps: 'rebleach.fps',
   ice: 'rebleach.ice',
   lanIp: 'rebleach.lanIp',
+  encode: 'rebleach.encodeWidth',
 };
 
 function loadSettings() {
@@ -53,6 +60,7 @@ function loadSettings() {
   pick(LS.fps, $('fps'), '30');
   pick(LS.ice, $('ice'));
   pick(LS.lanIp, $('lan-ip'));
+  pick(LS.encode, $('encode-select'));
 }
 
 function saveSettings(args) {
@@ -104,11 +112,13 @@ async function boot() {
     }
   });
 
-  // 被控端推送的显示器清单 → 填充切换下拉
+  // 被控端推送的显示器清单 → 填充切换下拉（保留原点用于跨屏拖拽）
   await listen('monitors', (ev) => {
     const list = ev.payload || [];
+    state.monitors = list;
     webLog('info', `[monitors] ${list.length} 台显示器`);
     const sel = $('monitor-select');
+    const prev = state.curMonitor >= 0 ? state.curMonitor : null;
     sel.innerHTML = '';
     for (const m of list) {
       const opt = document.createElement('option');
@@ -118,13 +128,33 @@ async function boot() {
       sel.appendChild(opt);
     }
     sel.disabled = !list.length;
+    if (list.length) {
+      // 采集默认从清单第一块屏开始，首次同步到 list[0]，避免拖拽绝对坐标算错
+      const idx = prev !== null && list.some((m) => m.index === prev)
+        ? prev
+        : list[0].index;
+      sel.value = String(idx);
+      state.curMonitor = idx;
+    } else {
+      state.curMonitor = -1;
+    }
   });
 
   // 被控端链路上报：编码 fps / 发送码率 / DataChannel 缓冲
   await listen('netstats', (ev) => {
     const p = ev.payload || {};
+    const fps = Math.round(p.fps || 0);
+    // fps 极低时给出明确提示，而不是只显示一个卡住的画面
+    const hint = fps > 0 && fps < 2 ? ' · ⚠️ 对端系统负载过高' : '';
     $('netstats').textContent =
-      `远端 ${Math.round(p.fps || 0)} fps · ${Math.round(p.kbps || 0)} kbps · 缓冲 ${Math.round((p.buffered || 0) / 1024)} KB`;
+      `远端 ${fps} fps · ${Math.round(p.kbps || 0)} kbps · 缓冲 ${Math.round((p.buffered || 0) / 1024)} KB${hint}`;
+  });
+
+  // 当前链路：局域网直连 / 直连 / 中转 + RTT
+  await listen('link-info', (ev) => {
+    const p = ev.payload || {};
+    state.link = p;
+    renderLink();
   });
 
   // 发现新版本 → 点亮工具栏更新按钮
@@ -142,8 +172,26 @@ async function boot() {
   bindToolbar();
   bindInput();
   bindCtl();
+  bindAccess();
+  await bindTerm();
   startFpsMeter();
-  initCtl();
+  await initCtl();
+  await initAccess();
+}
+
+/** 状态栏链路信息：局域网直连 / 直连 / 中转 + RTT */
+function renderLink() {
+  const p = state.link;
+  const el = $('link-info');
+  if (!p) {
+    el.textContent = '';
+    el.title = '';
+    return;
+  }
+  const label = p.kind === 'lan' ? '局域网直连' : p.kind === 'relay' ? '中转' : '直连';
+  const mark = p.kind === 'lan' ? '🟢' : p.kind === 'relay' ? '🟡' : '🔵';
+  el.textContent = `${mark} ${label} · ${Math.round(p.rtt_ms || 0)}ms`;
+  el.title = p.detail || '';
 }
 
 // 帧率必须由定时器算：WGC 只在画面变化时出帧，静止时没有新帧进来，
@@ -237,6 +285,7 @@ async function saveCtl() {
   }
   renderNodeSelect();
   renderNodeList();
+  refreshAccessInfo();
 }
 
 function bindCtl() {
@@ -334,6 +383,131 @@ function bindCtl() {
 }
 
 // ============================================================
+// 接入与 SSH：服务端凭据 / 公钥登记 / SSH 配置 / 安装命令
+// ============================================================
+async function initAccess() {
+  const cfg = state.ctl;
+  if (cfg) {
+    $('access-admin-user').value = cfg.admin_user || '';
+    $('access-admin-pass').value = cfg.admin_pass || '';
+  }
+  await refreshAccessInfo();
+}
+
+/** 刷新服务器地址与主控端公钥（切换节点后同步） */
+async function refreshAccessInfo() {
+  try {
+    const info = await invoke('access_info');
+    $('access-server').value = info.server_http || info.server || '';
+    $('access-pubkey').value = info.pubkey || '';
+    if (!$('access-admin-user').value) {
+      $('access-admin-user').value = info.admin_user || '';
+    }
+  } catch (err) {
+    setAccessStatus('读取接入信息失败：' + String(err));
+  }
+}
+
+function setAccessStatus(msg) {
+  $('access-status').textContent = msg;
+}
+
+async function copyText(text) {
+  try {
+    await navigator.clipboard.writeText(text);
+    return true;
+  } catch (_) {
+    return false;
+  }
+}
+
+/** 保存管理员凭据（接口失败时返回 false，避免后续调用无谓报错） */
+async function saveAdminCreds() {
+  if (!state.ctl) {
+    setAccessStatus('主控端配置未就绪，请稍候重试');
+    return false;
+  }
+  const user = $('access-admin-user').value.trim();
+  const pass = $('access-admin-pass').value;
+  if (!user || !pass) {
+    setAccessStatus('请填写管理员账号与密码');
+    return false;
+  }
+  state.ctl.admin_user = user;
+  state.ctl.admin_pass = pass;
+  try {
+    state.ctl = await invoke('ctl_save', { cfg: state.ctl });
+  } catch (err) {
+    setAccessStatus('保存凭据失败：' + String(err));
+    return false;
+  }
+  renderNodeSelect();
+  renderNodeList();
+  return true;
+}
+
+function bindAccess() {
+  $('access-copy-pub').addEventListener('click', async () => {
+    const key = $('access-pubkey').value;
+    if (!key) return;
+    setAccessStatus((await copyText(key)) ? '公钥已复制' : '复制失败，请手动选择文本');
+  });
+
+  $('access-register-key').addEventListener('click', async () => {
+    if (!(await saveAdminCreds())) return;
+    setAccessStatus('正在登记公钥…');
+    try {
+      await invoke('access_register_key');
+      setAccessStatus('公钥已登记（被控端将在 60 秒内按授权生效）');
+    } catch (err) {
+      setAccessStatus('登记失败：' + String(err));
+    }
+  });
+
+  $('access-save-admin').addEventListener('click', async () => {
+    if (await saveAdminCreds()) setAccessStatus('管理员凭据已保存到本机');
+  });
+
+  $('access-ssh-config').addEventListener('click', async () => {
+    if (!(await saveAdminCreds())) return;
+    setAccessStatus('正在生成 SSH 配置…');
+    try {
+      const r = await invoke('access_write_ssh_config', { backend: 'builtin', sshUser: null });
+      const aliases = r.aliases || [];
+      if (!aliases.length) {
+        setAccessStatus(`已写入 ${r.path}（当前没有生效授权，配置为空）`);
+      } else {
+        setAccessStatus(`已写入 ${r.path}，可用：${aliases.map((a) => 'ssh ' + a).join(' / ')}`);
+      }
+    } catch (err) {
+      setAccessStatus('生成失败：' + String(err));
+    }
+  });
+
+  $('access-new-token').addEventListener('click', async () => {
+    if (!(await saveAdminCreds())) return;
+    setAccessStatus('正在生成安装令牌…');
+    try {
+      const r = await invoke('access_new_enroll_token', {
+        note: $('access-note').value.trim(),
+        ttlSecs: Number($('access-ttl').value) || 3600,
+      });
+      $('access-cmd').value = r.command;
+      $('access-cmd-box').hidden = false;
+      setAccessStatus('安装命令已生成，请在被控端 PowerShell 中执行');
+    } catch (err) {
+      setAccessStatus('生成失败：' + String(err));
+    }
+  });
+
+  $('access-copy-cmd').addEventListener('click', async () => {
+    const cmd = $('access-cmd').value;
+    if (!cmd) return;
+    setAccessStatus((await copyText(cmd)) ? '安装命令已复制' : '复制失败，请手动选择文本');
+  });
+}
+
+// ============================================================
 // 连接 / 断开
 // ============================================================
 async function onConnectSubmit(ev) {
@@ -377,12 +551,31 @@ function enterSession(args) {
   $('session-view').hidden = false;
   $('stats').textContent = '';
   $('netstats').textContent = '';
+  $('link-info').textContent = '';
   $('file-status').textContent = '';
+  state.link = null;
+  state.monitors = [];
+  state.curMonitor = -1;
+  state.buttons.clear();
+  state.dragging = false;
+  state.switchPending = false;
 
+  termReset();
   $('toolbar').hidden = false;
   const sel = $('monitor-select');
   sel.innerHTML = '<option value="-1">等待清单…</option>';
   sel.disabled = true;
+
+  // 把上次保存的画质（编码宽度）同步给新会话，避免主控端显示 720p 而实际仍是 1080p
+  setTimeout(() => {
+    if (!state.active) return;
+    sendControl({
+      t: 'set_quality',
+      level: 'keep',
+      bitrate_kbps: 0,
+      max_width: Number($('encode-select').value) || 0,
+    });
+  }, 1500);
   $('hint').hidden = false;
   $('hint').textContent = '等待画面…';
   if (state.mediaPort) {
@@ -412,7 +605,14 @@ async function leaveSession() {
   $('status-text').textContent = '';
   $('stats').textContent = '';
   $('netstats').textContent = '';
+  $('link-info').textContent = '';
   $('file-status').textContent = '';
+  state.link = null;
+  state.monitors = [];
+  state.curMonitor = -1;
+  state.buttons.clear();
+  state.dragging = false;
+  termReset();
   $('peer').focus();
   $('peer').select();
 }
@@ -654,27 +854,98 @@ function remotePoint(ev) {
 
 const BUTTON_MAP = { 0: 0, 2: 1, 1: 2 }; // 左 / 右 / 中 → 协议 0/1/2
 
+function monitorByIndex(idx) {
+  return state.monitors.find((m) => m.index === idx) || null;
+}
+
+/**
+ * 拖拽时的绝对坐标：
+ * - 把 canvas 上的归一化位置换算成当前显示器的虚拟桌面物理坐标；
+ * - 指针越过当前屏边界时，找包含该点的相邻显示器并自动切换采集，
+ *   这样就能把窗口从一块屏拖到另一块屏（文档 P1 跨屏拖拽）。
+ */
+function dragPoint(ev) {
+  const r = canvas.getBoundingClientRect();
+  if (!r.width || !r.height) return null;
+  const m = monitorByIndex(state.curMonitor)
+    || state.monitors.find((x) => x.primary)
+    || state.monitors[0];
+  if (!m) return null;
+  const nx = (ev.clientX - r.left) / r.width;
+  const ny = (ev.clientY - r.top) / r.height;
+  const ox = Number(m.origin_x || 0);
+  const oy = Number(m.origin_y || 0);
+  const abx = Math.round(ox + nx * m.width);
+  const aby = Math.round(oy + ny * m.height);
+
+  const outside =
+    abx < ox || abx >= ox + m.width || aby < oy || aby >= oy + m.height;
+  if (outside && !state.switchPending) {
+    const next = state.monitors.find(
+      (t) =>
+        abx >= Number(t.origin_x || 0) &&
+        abx < Number(t.origin_x || 0) + t.width &&
+        aby >= Number(t.origin_y || 0) &&
+        aby < Number(t.origin_y || 0) + t.height
+    );
+    if (next && next.index !== m.index) {
+      webLog('info', `拖拽跨屏 → #${next.index}`);
+      state.curMonitor = next.index;
+      state.switchPending = true;
+      $('monitor-select').value = String(next.index);
+      sendControl({ t: 'switch_monitor', index: next.index });
+      setTimeout(() => {
+        state.switchPending = false;
+      }, 900);
+    }
+  }
+  return { x: abx, y: aby };
+}
+
 function bindInput() {
-  canvas.addEventListener('mousemove', (ev) => {
+  canvas.addEventListener('pointermove', (ev) => {
     if (!state.active) return;
     const now = performance.now();
-    if (now - state.lastMove < 16) return; // ~60Hz 上限
+    const dragging = state.buttons.size > 0;
+    // M1：拖拽同样限速 60Hz（旧版拖拽不限速，跨境会话会洪泛输入通道加剧滞后）
+    if (now - state.lastMove < 16) return;
+    state.lastMove = now;
+    if (dragging && state.monitors.length) {
+      const p = dragPoint(ev);
+      if (p) sendControl({ t: 'mouse_move_abs', x: p.x, y: p.y });
+      return;
+    }
     const p = remotePoint(ev);
     if (!p) return;
-    state.lastMove = now;
     sendControl({ t: 'mouse_move', x: p.x, y: p.y });
   });
 
-  canvas.addEventListener('mousedown', (ev) => {
+  canvas.addEventListener('pointerdown', (ev) => {
     if (!state.active) return;
     ev.preventDefault();
     canvas.focus();
+    try { canvas.setPointerCapture(ev.pointerId); } catch (_) {}
+    state.buttons.add(ev.button);
     sendControl({ t: 'mouse_down', b: BUTTON_MAP[ev.button] ?? 0 });
   });
 
+  const release = (ev) => {
+    if (!state.active) return;
+    if (!state.buttons.has(ev.button)) return;
+    state.buttons.delete(ev.button);
+    if (!state.buttons.size) {
+      try { canvas.releasePointerCapture(ev.pointerId); } catch (_) {}
+    }
+    sendControl({ t: 'mouse_up', b: BUTTON_MAP[ev.button] ?? 0 });
+  };
+  canvas.addEventListener('pointerup', release);
+  canvas.addEventListener('pointercancel', release);
+
   window.addEventListener('mouseup', (ev) => {
     if (!state.active) return;
-    // 在窗口任意位置释放都补发，避免远端按键卡住
+    // pointerup 已处理过则不重复发送；这里只兜底"pointerup 没收到"的情况
+    if (!state.buttons.has(ev.button)) return;
+    state.buttons.clear();
     sendControl({ t: 'mouse_up', b: BUTTON_MAP[ev.button] ?? 0 });
   });
 
@@ -776,6 +1047,7 @@ function bindToolbar() {
     const idx = Number($('monitor-select').value);
     if (idx >= 0) {
       webLog('info', `切换显示器 → #${idx}`);
+      state.curMonitor = idx;
       sendControl({ t: 'switch_monitor', index: idx });
     }
   });
@@ -791,9 +1063,40 @@ function bindToolbar() {
       }
       kbps = Math.max(150, Math.min(8000, Number(v) || 2000));
     }
-    sendControl({ t: 'set_quality', level, bitrate_kbps: kbps });
+    sendControl({
+      t: 'set_quality',
+      level,
+      bitrate_kbps: kbps,
+      max_width: Number($('encode-select').value) || 0,
+    });
     $('status-text').textContent =
-      level === 'custom' ? `画质：自定义 ${kbps} kbps` : `画质：${$('quality-select').selectedOptions[0].textContent}`;
+      level === 'custom' ? `码率：自定义 ${kbps} kbps` : `码率：${$('quality-select').selectedOptions[0].textContent}`;
+  });
+
+  // 编码画质（实际发出的分辨率上限），不再固定 1920×1080
+  $('encode-select').addEventListener('change', () => {
+    const maxWidth = Number($('encode-select').value) || 0;
+    localStorage.setItem(LS.encode, String(maxWidth));
+    sendControl({ t: 'set_quality', level: 'keep', bitrate_kbps: 0, max_width: maxWidth });
+    $('status-text').textContent = `编码画质：${$('encode-select').selectedOptions[0].textContent}`;
+  });
+
+  // Win 快捷键：WebView 收不到系统 Win 键，提供常用组合的按钮入口
+  $('win-select').addEventListener('change', () => {
+    const v = $('win-select').value;
+    $('win-select').value = '';
+    if (!v) return;
+    const combo = v.split('+');
+    const keys = combo.map((k) => (k === 'Win' ? 'LWin' : k));
+    if (combo.length === 1) {
+      sendControl({ t: 'key_down', k: keys[0], mods: [] });
+      sendControl({ t: 'key_up', k: keys[0], mods: [] });
+    } else {
+      // 依次按下修饰键和主键；被控端 OS 会保持按键状态，无需重复带 mods
+      for (const k of keys) sendControl({ t: 'key_down', k, mods: [] });
+      for (const k of keys.slice().reverse()) sendControl({ t: 'key_up', k, mods: [] });
+    }
+    $('status-text').textContent = `已发送 Win 快捷键：${v}`;
   });
 
   $('res-select').addEventListener('change', () => {
@@ -813,6 +1116,13 @@ function bindToolbar() {
   $('refresh-btn').addEventListener('click', () => {
     sendControl({ t: 'refresh' });
     $('status-text').textContent = '已请求刷新画面';
+  });
+
+  // 画面卡死且刷新无效时，让被控端 Agent 自愈重启（2 秒后拉起新进程）
+  $('heal-btn').addEventListener('click', () => {
+    if (!confirm('让被控端 Agent 自愈重启？连接会断开约 5 秒后自动重连。')) return;
+    sendControl({ t: 'restart_agent', soft: false, reason: '主控端手动触发' });
+    $('status-text').textContent = '已下发自愈重启指令';
   });
 
   $('add-virtual-btn').addEventListener('click', async () => {
@@ -942,6 +1252,179 @@ async function onFilePicked() {
     $('file-btn').disabled = false;
     setTimeout(() => { $('file-status').textContent = ''; }, 5000);
   }
+}
+
+// ============================================================
+// 终端：term DataChannel（sid 多路复用）→ xterm.js
+// ============================================================
+const termState = {
+  ready: false,
+  nextSid: 1,
+  activeSid: null,
+  tabs: new Map(), // sid -> { sid, pane, btn, term, fit, shell, opened, exited }
+};
+
+/** 进入会话 / 断开时清空终端视图（服务端进程随会话结束回收） */
+function termReset() {
+  for (const [, t] of termState.tabs) {
+    try { t.term.dispose(); } catch {}
+    t.pane.remove();
+    t.btn.remove();
+  }
+  termState.tabs.clear();
+  termState.ready = false;
+  termState.nextSid = 1;
+  termState.activeSid = null;
+  $('view-tabs').hidden = true;
+  $('term-panes').hidden = true;
+  $('desktop-pane').hidden = false;
+  document.querySelector('.view-tab[data-view="desktop"]').classList.add('active');
+}
+
+/** 切换 桌面 / 指定终端标签 */
+function termSelectView(view) {
+  const isDesktop = view === 'desktop';
+  $('desktop-pane').hidden = !isDesktop;
+  $('term-panes').hidden = isDesktop;
+  document
+    .querySelector('.view-tab[data-view="desktop"]')
+    .classList.toggle('active', isDesktop);
+  for (const [sid, t] of termState.tabs) {
+    const active = !isDesktop && String(sid) === view;
+    t.pane.classList.toggle('active', active);
+    t.btn.classList.toggle('active', active);
+  }
+  termState.activeSid = isDesktop ? null : Number(view);
+  if (isDesktop) return;
+  const t = termState.tabs.get(Number(view));
+  if (!t) return;
+  requestAnimationFrame(() => {
+    try { t.fit.fit(); } catch {}
+    if (t.opened) {
+      invoke('term_resize', { sid: t.sid, cols: t.term.cols, rows: t.term.rows }).catch(() => {});
+    }
+    t.term.focus();
+  });
+}
+
+async function termOpenTab(shell) {
+  if (!termState.ready || !state.active) return;
+  const sid = termState.nextSid++;
+  const pane = document.createElement('div');
+  pane.className = 'term-pane';
+  $('term-panes').appendChild(pane);
+
+  const term = new Terminal({
+    cursorBlink: true,
+    fontSize: 13,
+    fontFamily: 'Consolas, "Cascadia Mono", "Microsoft YaHei Mono", monospace',
+    scrollback: 5000,
+    theme: { background: '#0b0e14', foreground: '#d7dce5', cursor: '#7ab8ff' },
+  });
+  const fit = new FitAddon.FitAddon();
+  term.loadAddon(fit);
+  term.open(pane);
+
+  const tab = { sid, pane, term, fit, shell, opened: false, exited: false, btn: null };
+  termState.tabs.set(sid, tab);
+
+  const btn = document.createElement('button');
+  btn.type = 'button';
+  btn.className = 'view-tab';
+  btn.dataset.view = String(sid);
+  btn.innerHTML = `<span>终端 ${sid}</span><span class="close" title="关闭终端">×</span>`;
+  btn.addEventListener('click', (e) => {
+    if (e.target.classList.contains('close')) termCloseTab(sid);
+    else termSelectView(String(sid));
+  });
+  $('view-tab-list').appendChild(btn);
+  tab.btn = btn;
+
+  term.onData((d) => {
+    if (tab.exited) return;
+    invoke('term_input', { sid, data: d }).catch(() => {});
+  });
+  term.onResize(({ cols, rows }) => {
+    if (!tab.opened) return;
+    invoke('term_resize', { sid, cols, rows }).catch(() => {});
+  });
+
+  termSelectView(String(sid));
+  // 等一帧让 pane 有尺寸，fit 才有正确的 cols/rows
+  await new Promise((r) => requestAnimationFrame(r));
+  try { fit.fit(); } catch {}
+
+  try {
+    await invoke('term_open', {
+      sid,
+      cols: term.cols || 80,
+      rows: term.rows || 24,
+      shell: shell || 'cmd',
+      cwd: null,
+    });
+    tab.opened = true;
+  } catch (err) {
+    term.write(`\r\n\x1b[31m终端打开失败: ${err}\x1b[0m\r\n`);
+    return;
+  }
+  term.focus();
+}
+
+function termCloseTab(sid) {
+  const t = termState.tabs.get(sid);
+  if (!t) return;
+  invoke('term_close', { sid }).catch(() => {});
+  try { t.term.dispose(); } catch {}
+  t.pane.remove();
+  t.btn.remove();
+  termState.tabs.delete(sid);
+  if (termState.activeSid !== sid) return;
+  const rest = [...termState.tabs.keys()];
+  termSelectView(rest.length ? String(rest[rest.length - 1]) : 'desktop');
+}
+
+/** boot 时绑定终端相关事件 */
+async function bindTerm() {
+  await listen('term-ready', () => {
+    termState.ready = true;
+    $('view-tabs').hidden = false;
+    webLog('info', '对端支持终端');
+  });
+  await listen('term-opened', (ev) => {
+    const sid = ev.payload && ev.payload.sid;
+    const t = termState.tabs.get(sid);
+    if (!t) return;
+    t.opened = true;
+    try { t.fit.fit(); } catch {}
+    invoke('term_resize', { sid, cols: t.term.cols, rows: t.term.rows }).catch(() => {});
+  });
+  await listen('term-data', (ev) => {
+    const p = ev.payload || {};
+    const t = termState.tabs.get(p.sid);
+    if (t) t.term.write(p.data || '');
+  });
+  await listen('term-exit', (ev) => {
+    const p = ev.payload || {};
+    const t = termState.tabs.get(p.sid);
+    if (!t) return;
+    t.exited = true;
+    t.term.write(`\r\n\x1b[90m[进程已退出 code=${p.code}]\x1b[0m\r\n`);
+  });
+  await listen('term-err', (ev) => {
+    const p = ev.payload || {};
+    const t = termState.tabs.get(p.sid);
+    if (t) t.term.write(`\r\n\x1b[31m${p.msg || '终端错误'}\x1b[0m\r\n`);
+  });
+
+  $('term-new-btn').addEventListener('click', () => termOpenTab($('term-shell').value));
+  document
+    .querySelector('.view-tab[data-view="desktop"]')
+    .addEventListener('click', () => termSelectView('desktop'));
+  window.addEventListener('resize', () => {
+    const t = termState.tabs.get(termState.activeSid);
+    if (!t) return;
+    try { t.fit.fit(); } catch {}
+  });
 }
 
 function b64encode(bytes) {

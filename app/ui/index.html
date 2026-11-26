@@ -4,6 +4,7 @@
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>Rebleach 主控端</title>
+  <link rel="stylesheet" href="vendor/xterm/xterm.css" />
   <link rel="stylesheet" href="style.css" />
 </head>
 <body>
@@ -89,6 +90,56 @@
           <p id="node-error" class="error"></p>
         </form>
       </section>
+
+      <section class="card">
+        <h2>接入与 SSH</h2>
+        <p class="sub">服务端授权一键安装被控端，并为命令行 ssh 生成配置</p>
+
+        <label>
+          <span>服务器</span>
+          <input id="access-server" class="mono" readonly />
+        </label>
+
+        <label>
+          <span>主控端 SSH 公钥（登记后按有效授权下发到被控端）</span>
+          <textarea id="access-pubkey" class="mono" rows="3" readonly spellcheck="false"></textarea>
+        </label>
+        <div class="id-row">
+          <button id="access-copy-pub" type="button" class="tb-btn">复制公钥</button>
+          <button id="access-register-key" type="button" class="tb-btn">登记公钥</button>
+        </div>
+
+        <label>
+          <span>管理员账号</span>
+          <input id="access-admin-user" placeholder="服务端管理员账号" spellcheck="false" />
+        </label>
+        <label>
+          <span>管理员密码（仅存本机）</span>
+          <input id="access-admin-pass" type="password" placeholder="服务端管理员密码" />
+        </label>
+        <div class="id-row">
+          <button id="access-save-admin" type="button" class="tb-btn">保存凭据</button>
+          <button id="access-ssh-config" type="button" class="tb-btn">生成 SSH 配置</button>
+        </div>
+
+        <label>
+          <span>安装令牌</span>
+          <select id="access-ttl">
+            <option value="900">15 分钟</option>
+            <option value="3600" selected>1 小时</option>
+            <option value="86400">24 小时</option>
+          </select>
+        </label>
+        <div class="id-row">
+          <input id="access-note" placeholder="备注（如：办公室 PC）" spellcheck="false" />
+          <button id="access-new-token" type="button" class="tb-btn">生成安装命令</button>
+        </div>
+        <div id="access-cmd-box" hidden>
+          <textarea id="access-cmd" class="mono" rows="2" readonly spellcheck="false"></textarea>
+          <button id="access-copy-cmd" type="button" class="tb-btn">复制命令</button>
+        </div>
+        <p id="access-status" class="hint-line"></p>
+      </section>
     </div>
   </main>
 
@@ -102,12 +153,22 @@
         </select>
       </label>
       <label class="tb-field">
-        <span>画质</span>
+        <span>码率</span>
         <select id="quality-select">
           <option value="balanced">均衡</option>
           <option value="low">流畅（低带宽）</option>
           <option value="high">高清</option>
           <option value="custom">自定义码率…</option>
+        </select>
+      </label>
+      <label class="tb-field">
+        <span>画质</span>
+        <select id="encode-select">
+          <option value="1">原画（跟随显示器）</option>
+          <option value="1920" selected>1080p（1920）</option>
+          <option value="1600">1600</option>
+          <option value="1280">720p（1280）</option>
+          <option value="960">540p（960）</option>
         </select>
       </label>
       <label class="tb-field">
@@ -122,7 +183,19 @@
           <option value="0x0">恢复原始</option>
         </select>
       </label>
+      <select id="win-select" class="tb-btn" title="Win 快捷键">
+        <option value="">Win 快捷键</option>
+        <option value="Win">Win 开始菜单</option>
+        <option value="Win+d">Win+D 显示桌面</option>
+        <option value="Win+e">Win+E 资源管理器</option>
+        <option value="Win+r">Win+R 运行</option>
+        <option value="Win+i">Win+I 设置</option>
+        <option value="Win+l">Win+L 锁定</option>
+        <option value="Win+Tab">Win+Tab 任务视图</option>
+        <option value="Alt+Tab">Alt+Tab 切换窗口</option>
+      </select>
       <button id="refresh-btn" type="button" class="tb-btn">刷新画面</button>
+      <button id="heal-btn" type="button" class="tb-btn">自愈重启</button>
       <button id="add-virtual-btn" type="button" class="tb-btn">+ 虚拟屏</button>
       <button id="remove-virtual-btn" type="button" class="tb-btn">删虚拟屏</button>
       <button id="clip-btn" type="button" class="tb-btn on">剪贴板</button>
@@ -136,18 +209,36 @@
       <span id="file-status"></span>
       <button id="update-btn" type="button" class="tb-btn" hidden>有新版本</button>
     </div>
+    <div id="view-tabs" hidden>
+      <div id="view-tab-list">
+        <button class="view-tab active" data-view="desktop" type="button">桌面</button>
+      </div>
+      <span class="spacer"></span>
+      <select id="term-shell" title="新建终端类型">
+        <option value="cmd">CMD</option>
+        <option value="powershell">PowerShell</option>
+        <option value="pwsh">PowerShell 7</option>
+      </select>
+      <button id="term-new-btn" type="button" class="tb-btn">+ 终端</button>
+    </div>
     <div id="stage">
-      <canvas id="screen" tabindex="0"></canvas>
-      <p id="hint">等待画面…</p>
+      <div id="desktop-pane">
+        <canvas id="screen" tabindex="0"></canvas>
+        <p id="hint">等待画面…</p>
+      </div>
+      <div id="term-panes" hidden></div>
     </div>
     <footer id="statusbar">
       <span id="status-text">连接中…</span>
+      <span id="link-info" title=""></span>
       <span id="netstats"></span>
       <span id="stats"></span>
       <button id="disconnect-btn" type="button">断开</button>
     </footer>
   </section>
 
+  <script src="vendor/xterm/xterm.js"></script>
+  <script src="vendor/xterm/addon-fit.js"></script>
   <script src="app.js"></script>
 </body>
 </html>

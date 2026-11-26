@@ -349,6 +349,10 @@ fn apply(en: &mut Enigo, msg: ControlMsg) -> Result<()> {
             let (px, py) = map_point(x, y);
             en.move_mouse(px, py, Coordinate::Abs)?;
         }
+        ControlMsg::MouseMoveAbs { x, y } => {
+            // 已经是虚拟桌面绝对物理坐标，直接注入（跨屏拖拽窗口用）
+            en.move_mouse(x, y, Coordinate::Abs)?;
+        }
         ControlMsg::MouseDown { b } => {
             en.button(to_button(b), Direction::Press)?;
         }
@@ -470,7 +474,9 @@ fn map_key(k: &str) -> Key {
         "Shift" => Key::Shift,
         "Control" => Key::Control,
         "Alt" => Key::Alt,
-        "Meta" => Key::Meta,
+        // Win 键：主控端 WebView 收不到系统 Win 键时由原生钩子发送 "LWin"/"RWin"
+        "Meta" | "LWin" => Key::LWin,
+        "RWin" => Key::RWin,
         other => {
             // 兜底：取首字符
             Key::Unicode(other.chars().next().unwrap_or(' '))
@@ -919,57 +925,43 @@ pub fn power(action: &str, delay_secs: u32) {
     }
 }
 
-/// 首次修改前的原始分辨率，用于主控端“恢复原始分辨率”(0x0)
-static ORIGINAL_MODE: Mutex<Option<(u32, u32)>> = Mutex::new(None);
+/// 每个显示器首次被修改前的原始分辨率（设备名 → (宽, 高)）。
+/// 会话结束 / Agent 启动时用 restore_display_modes() 全部还原，避免降级档位残留（文档 P1-C）
+static ORIGINAL_MODES: std::sync::OnceLock<Mutex<std::collections::HashMap<String, (u32, u32)>>> =
+    std::sync::OnceLock::new();
 
-/// 修改主显示器分辨率：选择最接近的受支持模式。
-/// `width/height` 为 0 时恢复首次修改前的模式。
-fn set_resolution(width: u32, height: u32) -> Result<String> {
+fn original_modes() -> &'static Mutex<std::collections::HashMap<String, (u32, u32)>> {
+    ORIGINAL_MODES.get_or_init(|| Mutex::new(std::collections::HashMap::new()))
+}
+
+/// 当前正在被主控端观看的显示器设备名（\\.\DISPLAYn）。
+/// 修改分辨率时优先作用于它，而不是永远改主屏
+static ACTIVE_MONITOR: Mutex<Option<String>> = Mutex::new(None);
+
+/// 采集线程切换显示器时同步：设备名 + 虚拟桌面原点 + 物理尺寸
+pub fn set_active_monitor(name: &str, origin_x: i32, origin_y: i32, w: u32, h: u32) {
+    *ACTIVE_MONITOR.lock() = Some(name.to_string());
+    #[cfg(windows)]
+    crate::window_placement::set_target(origin_x, origin_y, w as i32, h as i32);
+}
+
+fn device_name_ptr(name: &str) -> Vec<u16> {
+    let mut buf: Vec<u16> = name.encode_utf16().collect();
+    while buf.len() < 32 {
+        buf.push(0);
+    }
+    buf.truncate(32);
+    buf[31] = 0;
+    buf
+}
+
+/// 在指定显示器上查找分辨率匹配且刷新率最高的模式
+fn find_mode(name: &[u16], want_w: u32, want_h: u32) -> Option<(u32, u32, u32)> {
     use windows::Win32::Graphics::Gdi::*;
     use windows::core::PCWSTR;
-
     unsafe {
-        // 主显示器设备名
-        let mut dev = DISPLAY_DEVICEW {
-            cb: std::mem::size_of::<DISPLAY_DEVICEW>() as u32,
-            ..Default::default()
-        };
-        let mut name: Option<[u16; 32]> = None;
-        let mut idx = 0u32;
-        while EnumDisplayDevicesW(PCWSTR::null(), idx, &mut dev, 0).as_bool() {
-            if dev.StateFlags.contains(DISPLAY_DEVICE_PRIMARY_DEVICE) {
-                name = Some(dev.DeviceName);
-                break;
-            }
-            idx += 1;
-        }
-        let name = name.ok_or_else(|| anyhow!("未找到主显示器"))?;
         let dev_name = PCWSTR(name.as_ptr());
-
-        let mut cur = DEVMODEW {
-            dmSize: std::mem::size_of::<DEVMODEW>() as u16,
-            ..Default::default()
-        };
-        if !EnumDisplaySettingsW(dev_name, ENUM_CURRENT_SETTINGS, &mut cur).as_bool() {
-            return Err(anyhow!("读取当前分辨率失败"));
-        }
-        // 记录原始模式（仅第一次）
-        {
-            let mut orig = ORIGINAL_MODE.lock();
-            if orig.is_none() {
-                *orig = Some((cur.dmPelsWidth, cur.dmPelsHeight));
-            }
-        }
-        let (want_w, want_h) = if width == 0 || height == 0 {
-            ORIGINAL_MODE
-                .lock()
-                .unwrap_or((cur.dmPelsWidth, cur.dmPelsHeight))
-        } else {
-            (width, height)
-        };
-
-        // 枚举该显示器所有模式，选分辨率匹配且刷新率最高者
-        let mut best: Option<DEVMODEW> = None;
+        let mut best: Option<(u32, u32, u32)> = None;
         let mut i = 0u32;
         loop {
             let mut dm = DEVMODEW {
@@ -980,9 +972,38 @@ fn set_resolution(width: u32, height: u32) -> Result<String> {
                 break;
             }
             if dm.dmPelsWidth == want_w && dm.dmPelsHeight == want_h {
+                if best.map(|b| dm.dmDisplayFrequency > b.2).unwrap_or(true) {
+                    best = Some((dm.dmPelsWidth, dm.dmPelsHeight, dm.dmDisplayFrequency));
+                }
+            }
+            i += 1;
+        }
+        best
+    }
+}
+
+fn apply_mode(name: &[u16], want_w: u32, want_h: u32) -> Result<()> {
+    use windows::Win32::Graphics::Gdi::*;
+    use windows::core::PCWSTR;
+    unsafe {
+        let dev_name = PCWSTR(name.as_ptr());
+        let mode = find_mode(name, want_w, want_h)
+            .ok_or_else(|| anyhow!("显示器不支持 {want_w}x{want_h}"))?;
+        // 重新枚举并取匹配项，构造 DEVMODEW
+        let mut best: Option<DEVMODEW> = None;
+        let mut i = 0u32;
+        loop {
+            let mut dm = DEVMODEW {
+                dmSize: std::mem::size_of::<DEVMODEW>() as u16,
+                ..Default::default()
+            };
+            if !EnumDisplaySettingsW(dev_name, ENUM_DISPLAY_SETTINGS_MODE(i), &mut dm).as_bool() {
+                break;
+            }
+            if dm.dmPelsWidth == mode.0 && dm.dmPelsHeight == mode.1 {
                 if best
                     .as_ref()
-                    .map(|b| dm.dmDisplayFrequency > b.dmDisplayFrequency)
+                    .map(|b| dm.dmDisplayFrequency >= b.dmDisplayFrequency)
                     .unwrap_or(true)
                 {
                     best = Some(dm);
@@ -990,14 +1011,88 @@ fn set_resolution(width: u32, height: u32) -> Result<String> {
             }
             i += 1;
         }
-        let mut mode = best.ok_or_else(|| anyhow!("显示器不支持 {want_w}x{want_h}"))?;
-        mode.dmFields =
+        let mut dm = best.ok_or_else(|| anyhow!("显示器不支持 {want_w}x{want_h}"))?;
+        dm.dmFields =
             DEVMODE_FIELD_FLAGS(DM_PELSWIDTH.0 | DM_PELSHEIGHT.0 | DM_DISPLAYFREQUENCY.0);
-        let rc = ChangeDisplaySettingsExW(dev_name, Some(&mode), None, CDS_UPDATEREGISTRY, None);
+        let rc = ChangeDisplaySettingsExW(dev_name, Some(&dm), None, CDS_UPDATEREGISTRY, None);
         if rc == DISP_CHANGE_SUCCESSFUL {
-            Ok(format!("分辨率已切换为 {want_w}x{want_h}"))
+            Ok(())
         } else {
             Err(anyhow!("切换分辨率失败: {rc:?}"))
+        }
+    }
+}
+
+/// 修改「当前观看的显示器」分辨率：选择最接近的受支持模式。
+/// `width/height` 为 0 时恢复该显示器首次修改前的模式。
+fn set_resolution(width: u32, height: u32) -> Result<String> {
+    use windows::Win32::Graphics::Gdi::*;
+    use windows::core::PCWSTR;
+
+    unsafe {
+        // 优先使用当前采集的显示器；没有则退回主显示器
+        let mut name: Option<String> = ACTIVE_MONITOR.lock().clone().filter(|n| !n.is_empty());
+        if name.is_none() {
+            let mut dev = DISPLAY_DEVICEW {
+                cb: std::mem::size_of::<DISPLAY_DEVICEW>() as u32,
+                ..Default::default()
+            };
+            let mut idx = 0u32;
+            while EnumDisplayDevicesW(PCWSTR::null(), idx, &mut dev, 0).as_bool() {
+                if dev.StateFlags.contains(DISPLAY_DEVICE_PRIMARY_DEVICE) {
+                    name = Some(String::from_utf16_lossy(
+                        &dev.DeviceName[..dev.DeviceName.iter().position(|&c| c == 0).unwrap_or(32)],
+                    ));
+                    break;
+                }
+                idx += 1;
+            }
+        }
+        let name = name.ok_or_else(|| anyhow!("未找到可用显示器"))?;
+        let buf = device_name_ptr(&name);
+        let dev_name = PCWSTR(buf.as_ptr());
+
+        let mut cur = DEVMODEW {
+            dmSize: std::mem::size_of::<DEVMODEW>() as u16,
+            ..Default::default()
+        };
+        if !EnumDisplaySettingsW(dev_name, ENUM_CURRENT_SETTINGS, &mut cur).as_bool() {
+            return Err(anyhow!("读取当前分辨率失败"));
+        }
+        let current = (cur.dmPelsWidth, cur.dmPelsHeight);
+        // 记录原始模式（仅第一次，按设备分别记录）
+        {
+            let mut orig = original_modes().lock();
+            orig.entry(name.clone()).or_insert(current);
+        }
+        let (want_w, want_h) = if width == 0 || height == 0 {
+            original_modes().lock().get(&name).copied().unwrap_or(current)
+        } else {
+            (width, height)
+        };
+
+        apply_mode(&buf, want_w, want_h)?;
+        Ok(format!("{name} 分辨率已切换为 {want_w}x{want_h}"))
+    }
+}
+
+/// 还原所有被修改过的显示器分辨率。会话结束 / Agent 退出时调用，
+/// 避免下一次会话或本机使用仍停留在 1280x720（文档 P1-C）
+pub fn restore_display_modes() {
+    let saved: Vec<(String, (u32, u32))> = {
+        let mut orig = original_modes().lock();
+        if orig.is_empty() {
+            return;
+        }
+        let all = orig.iter().map(|(k, v)| (k.clone(), *v)).collect();
+        orig.clear();
+        all
+    };
+    for (name, (w, h)) in saved {
+        let buf = device_name_ptr(&name);
+        match apply_mode(&buf, w, h) {
+            Ok(()) => info!("🖥️ 已恢复 {name} 原始分辨率 {w}x{h}"),
+            Err(e) => warn!("🖥️ 恢复 {name} 分辨率 {w}x{h} 失败: {e:#}"),
         }
     }
 }

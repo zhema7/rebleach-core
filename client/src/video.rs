@@ -1,12 +1,13 @@
 // 视频管线：常驻 WGC 采集（GPU 缩放到 1920 宽）→ BGRA→I420 → openh264 编码 → DataChannel 发送
 //          + 主控端收帧组装 + I420→RGBA（渲染前转换）
+use std::collections::VecDeque;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use bytes::Bytes;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::capture;
 use crate::control;
@@ -46,6 +47,12 @@ impl CaptureHandle {
     }
 }
 
+/// 进程启动以来的毫秒数（惰性初始化起点）
+fn proc_ms() -> u64 {
+    static START: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+    START.get_or_init(Instant::now).elapsed().as_millis() as u64
+}
+
 /// 采集/编码统计（多线程共享）
 pub struct Stats {
     /// 累计已编码发送帧数
@@ -58,6 +65,32 @@ pub struct Stats {
     pub backlog: AtomicU64,
     /// 主控端手动指定画质后为 true：关闭自动码率自适应，避免被立刻改回去
     pub manual: AtomicBool,
+    /// 基础目标帧率（会话建立时的 fps，不随降级变化）
+    pub fps_base: AtomicU32,
+    /// 当前目标帧率（降级时会下调，采集/编码线程读取）
+    pub fps_target: AtomicU32,
+    /// 当前降级档位：0=全画质 1=1280宽 2=960宽
+    pub degrade: AtomicU32,
+    /// 采集配置代号：降级档位变化时自增，采集线程据此重建采集与编码
+    pub epoch: AtomicU64,
+    /// 上一统计窗口的平均转换耗时（微秒）
+    pub conv_us: AtomicU64,
+    /// 上一统计窗口的平均编码耗时（微秒）
+    pub enc_us: AtomicU64,
+    /// 上次实际出帧时刻（进程启动起的毫秒数）：看门狗据此判断管线是否停摆
+    pub last_emit_ms: AtomicU64,
+    /// 主控端上报的丢失帧率（千分比，M1 应用层 AIMD 依据）
+    pub remote_loss_permille: AtomicU32,
+    /// 主控端上报的 ctrl 通道 RTT（ms）
+    pub remote_rtt_ms: AtomicU32,
+    /// 主控端上报的有效吞吐（kbps）
+    pub remote_goodput_kbps: AtomicU32,
+    /// 主控端上报的接收帧率 ×10（静止画面时避免盲目抬码率）
+    pub remote_fps_x10: AtomicU32,
+    /// 主控端请求关键帧的计数器：编码线程发现变化即 `force_intra_frame`
+    pub keyframe_req: AtomicU64,
+    /// 编码线程已消费到的 keyframe_req 值
+    pub keyframe_done: AtomicU64,
 }
 
 /// 背压水位按"时间"折算：队列里最多允许积压 250ms 的数据。
@@ -72,7 +105,30 @@ impl Stats {
             bitrate: AtomicU32::new(bitrate),
             backlog: AtomicU64::new(0),
             manual: AtomicBool::new(false),
+            fps_base: AtomicU32::new(30),
+            fps_target: AtomicU32::new(30),
+            degrade: AtomicU32::new(0),
+            epoch: AtomicU64::new(0),
+            conv_us: AtomicU64::new(0),
+            enc_us: AtomicU64::new(0),
+            last_emit_ms: AtomicU64::new(proc_ms()),
+            remote_loss_permille: AtomicU32::new(0),
+            remote_rtt_ms: AtomicU32::new(0),
+            remote_goodput_kbps: AtomicU32::new(0),
+            remote_fps_x10: AtomicU32::new(0),
+            keyframe_req: AtomicU64::new(0),
+            keyframe_done: AtomicU64::new(0),
         }
+    }
+
+    /// 记录一次实际出帧（真实帧或静止保活帧）
+    pub fn touch_emit(&self) {
+        self.last_emit_ms.store(proc_ms(), Ordering::Relaxed);
+    }
+
+    /// 距上次出帧的毫秒数：看门狗判断管线是否停摆
+    pub fn ms_since_emit(&self) -> u64 {
+        proc_ms().saturating_sub(self.last_emit_ms.load(Ordering::Relaxed))
     }
 
     /// 主控端画质档位：low/balanced/high/custom。
@@ -89,37 +145,182 @@ impl Stats {
         self.bitrate.store(bps, Ordering::Relaxed);
         info!("🎚️ 主控端指定画质 {level} → {} kbps", bps / 1000);
     }
+
+    /// 主控端指定编码宽度上限（0=保持不变，1=原画不限制，>=640=像素上限）。
+    /// 变更后自增 epoch，采集线程会按新宽度重建采集与编码器。
+    pub fn set_encode_cap(&self, max_width: u32) {
+        if max_width == 0 {
+            return; // 旧主控端：不改编码宽度
+        }
+        USER_MAX_WIDTH.store(max_width, Ordering::Relaxed);
+        let lvl = self.degrade.load(Ordering::Relaxed).min(2) as usize;
+        set_active_width(level_width(lvl));
+        self.epoch.fetch_add(1, Ordering::Relaxed);
+        if max_width == 1 {
+            info!("🖼️ 主控端画质：原画（不限制编码宽度）");
+        } else {
+            info!("🖼️ 主控端画质：编码宽度上限 {max_width}px");
+        }
+    }
 }
 
 /// 默认码率：1920x1200 屏幕内容 1080p 下 2Mbps 起步即可，靠自适应按需上升
 pub const DEFAULT_BITRATE: u32 = 2_000_000;
 
+/// 负载自适应：降级档位对应的编码宽度上限。
+/// 档位 0 不使用此表（用主控端选择的画质上限），1/2 档固定为 1280/960。
+const DEGRADE_WIDTHS: [u32; 3] = [MAX_ENCODE_WIDTH, 1280, 960];
+const DEGRADE_FPS_CAPS: [u32; 3] = [0, 15, 10];
+
+/// 主控端选择的编码宽度上限：默认 1920；1 表示不限制（原画）；>=640 为具体像素
+static USER_MAX_WIDTH: AtomicU32 = AtomicU32::new(MAX_ENCODE_WIDTH);
+/// 当前实际生效的编码宽度上限（考虑降级档位后）
+static ACTIVE_MAX_WIDTH: AtomicU32 = AtomicU32::new(MAX_ENCODE_WIDTH);
+
+/// 当前生效的编码宽度上限（0 表示不限制）
+fn max_encode_width() -> u32 {
+    ACTIVE_MAX_WIDTH.load(Ordering::Relaxed)
+}
+
+fn set_active_width(w: u32) {
+    ACTIVE_MAX_WIDTH.store(if w == 1 { 0 } else { w }, Ordering::Relaxed);
+}
+
+/// 某降级档位实际使用的编码宽度上限（0 = 不限制）
+/// 档位 0 用主控端选择值；低档位取主控端选择值与固定档位宽度的较小者
+fn level_width(lvl: usize) -> u32 {
+    let user = USER_MAX_WIDTH.load(Ordering::Relaxed);
+    let user_cap = if user == 1 { 0 } else { user.max(640) };
+    let lvl = lvl.min(2);
+    if lvl == 0 {
+        user_cap
+    } else if user_cap == 0 {
+        DEGRADE_WIDTHS[lvl]
+    } else {
+        user_cap.min(DEGRADE_WIDTHS[lvl])
+    }
+}
+
 /// 启动采集监督线程：内部循环拉起采集+编码线程；
 /// 收到 SwitchMonitor 命令时平滑重建采集（编码器随之按新分辨率重建）
+/// 编码线程 → 发送任务的队列容量。故意比 `MAX_SEND_QUEUE` 大：
+/// 发送侧才能在积压时按「丢最旧」裁剪，而不是让编码线程丢新帧。
+pub const SEND_QUEUE_CAP: usize = 8;
+
 pub fn spawn_capture_supervisor(
-    tx: tokio::sync::mpsc::UnboundedSender<Vec<u8>>,
+    tx: tokio::sync::mpsc::Sender<Vec<u8>>,
     fps: u64,
     stats: Arc<Stats>,
 ) -> CaptureHandle {
+    // 远控在"整机被 CPU/GPU 任务打满"时最有价值，默认优先级会被饿死
+    // （实测 python 视频生成占满 CPU 时转换耗时 1.6ms → 14249ms，fps 30 → 0.1）
+    boost_process_priority();
+    stats.fps_base.store(fps as u32, Ordering::Relaxed);
+    stats.fps_target.store(fps as u32, Ordering::Relaxed);
+    stats.degrade.store(0, Ordering::Relaxed);
+    // 新会话从默认 1080p 档开始，避免上一次会话的画质/降级档位残留（文档 P1-C）
+    USER_MAX_WIDTH.store(MAX_ENCODE_WIDTH, Ordering::Relaxed);
+    set_active_width(MAX_ENCODE_WIDTH);
     let (cmd_tx, cmd_rx) = std::sync::mpsc::channel::<CaptureCmd>();
+    // 自愈看门狗：管线连续 6s 没有任何出帧（含静止保活）→ 重建采集；
+    // 60s 内连续 3 次自愈仍不恢复 → 重启 Agent 进程
+    let alive = Arc::new(AtomicBool::new(true));
+    {
+        let stats = stats.clone();
+        let cmd_tx = cmd_tx.clone();
+        let alive = alive.clone();
+        std::thread::spawn(move || {
+            let mut last_heal = Instant::now();
+            let mut heals: u32 = 0;
+            while alive.load(Ordering::Relaxed) {
+                std::thread::sleep(Duration::from_millis(500));
+                if !alive.load(Ordering::Relaxed) {
+                    break;
+                }
+                let idle_ms = stats.ms_since_emit();
+                if idle_ms < 6_000 {
+                    continue;
+                }
+                if last_heal.elapsed() > Duration::from_secs(60) {
+                    heals = 0;
+                }
+                heals += 1;
+                last_heal = Instant::now();
+                warn!(
+                    "🩺 出帧已中断 {:.1}s（第 {heals} 次自愈）：重建采集",
+                    idle_ms as f64 / 1000.0
+                );
+                let _ = cmd_tx.send(CaptureCmd::Restart);
+                stats.touch_emit();
+                if heals >= 3 {
+                    restart_agent_process("采集管线连续 3 次自愈无效");
+                }
+            }
+        });
+    }
+    let alive_sup = alive.clone();
     std::thread::spawn(move || {
         let mut monitor: Option<usize> = None;
+        let mut failures: u32 = 0;
         loop {
-            match capture_thread(tx.clone(), fps, monitor, &cmd_rx, &stats) {
+            match capture_thread(tx.clone(), monitor, &cmd_rx, &stats) {
                 Ok(CaptureOutcome::Switch(i)) => {
                     monitor = Some(i as usize);
+                    failures = 0;
                 }
-                Ok(CaptureOutcome::Restart) => {}
+                Ok(CaptureOutcome::Restart) => failures = 0,
                 Ok(CaptureOutcome::Quit) => break,
                 Err(e) => {
-                    error!("采集线程退出: {e:#}");
-                    break;
+                    failures += 1;
+                    if failures <= 3 || failures % 10 == 0 {
+                        error!("采集启动失败（第 {failures} 次）: {e:#}，2s 后重试");
+                    }
+                    // 不退出监督线程：显示器重编号/拓扑变化后能自动恢复，
+                    // "刷新画面"指令也仍然有效（旧版这里直接 break，导致刷新救不回来）
+                    std::thread::sleep(Duration::from_secs(2));
                 }
             }
         }
+        alive_sup.store(false, Ordering::Relaxed);
         info!("采集监督线程结束");
     });
     CaptureHandle { cmd_tx }
+}
+
+/// 自愈最后手段：延迟 2s 拉起自身副本并退出当前进程。
+/// 用 cmd 延迟启动是为了等单实例互斥、安装目录文件句柄释放干净
+pub fn restart_agent_process(reason: &str) -> ! {
+    warn!("♻️ Agent 自愈重启：{reason}");
+    // 防止故障机器上无限重启：环境变量里记次数，超过 3 次放弃
+    let n: u32 = std::env::var("REBLEACH_SELF_HEAL")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
+    if n >= 3 {
+        error!("自愈重启已达上限（{n} 次），放弃重启，等待人工处理");
+        std::process::exit(1);
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+            let cmd = format!(
+                "/C timeout /t 2 /nobreak >nul & start \"\" \"{}\"",
+                exe.display()
+            );
+            let _ = std::process::Command::new("cmd")
+                .arg(cmd)
+                .env("REBLEACH_SELF_HEAL", (n + 1).to_string())
+                .creation_flags(CREATE_NO_WINDOW)
+                .spawn();
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = std::process::Command::new(exe).spawn();
+        }
+    }
+    std::process::exit(0);
 }
 
 /// 转换完成的帧 + 采集侧耗时，交给编码线程（流水线）
@@ -130,16 +331,28 @@ struct Prepared {
 }
 
 fn capture_thread(
-    tx: tokio::sync::mpsc::UnboundedSender<Vec<u8>>,
-    fps: u64,
+    tx: tokio::sync::mpsc::Sender<Vec<u8>>,
     monitor: Option<usize>,
     cmd_rx: &std::sync::mpsc::Receiver<CaptureCmd>,
     stats: &Arc<Stats>,
 ) -> Result<CaptureOutcome> {
+    // 采集线程是出帧入口：与编码线程同档，整机繁忙时不被外部任务饿死
+    unsafe {
+        use windows::Win32::System::Threading::{
+            GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_ABOVE_NORMAL,
+        };
+        let _ = SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);
+    }
+    // 降级档位在采集监督层读取：降级后重建采集 + 编码，分辨率/帧率随之下调
+    let gen_at_start = stats.epoch.load(Ordering::Relaxed);
+    let fps = (stats.fps_target.load(Ordering::Relaxed) as u64).max(1);
     // 常驻 WGC 会话 + GPU 下采样：帧到达时在 GPU 上直接缩到编码尺寸再回读（9.2MB），
     // 省掉 xcap 每帧全尺寸回读 + 两次 20MB 克隆 + 通道交换
     // DDA 采集线程按同一目标帧率限速，先写入全局再建采集
     capture::set_target_fps(fps);
+    let lvl = stats.degrade.load(Ordering::Relaxed).min(2) as usize;
+    let active_w = level_width(lvl);
+    set_active_width(active_w);
     let cap = capture::Capture::start_for(monitor).context("启动屏幕采集失败")?;
     let (w, h) = (cap.src_w as i32, cap.src_h as i32);
     let (ew, eh) = (cap.dst_w, cap.dst_h);
@@ -151,6 +364,8 @@ fn capture_thread(
         cap.origin_x,
         cap.origin_y,
     );
+    // 记录当前观看的显示器：主控端改分辨率时作用于它；新窗口默认落在这块屏
+    control::set_active_monitor(&cap.name, cap.origin_x, cap.origin_y, cap.src_w, cap.src_h);
     info!(
         "🖥️ 采集启动: 显示器 {}x{} → 编码 {}x{}（backend={} + GPU 下采样 + 转换/编码流水）",
         w, h, ew, eh, backend
@@ -175,6 +390,16 @@ fn capture_thread(
     let interval = Duration::from_millis(1000 / fps.max(1));
     let mut dropped: u64 = 0;
     let outcome = loop {
+        // 负载自适应调整了档位：重建采集与编码（分辨率/帧率随档位变化）
+        if stats.epoch.load(Ordering::Relaxed) != gen_at_start {
+            let lvl_now = stats.degrade.load(Ordering::Relaxed).min(2) as usize;
+            let w_now = level_width(lvl_now);
+            let fps_now = stats.fps_target.load(Ordering::Relaxed);
+            info!(
+                "🔁 负载档位变化 → 重建采集（档位 {lvl_now} / 目标宽 {w_now}px / {fps_now}fps）"
+            );
+            break CaptureOutcome::Restart;
+        }
         // 画面静止时 WGC 不出帧，recv_timeout 醒来看切换命令，避免命令饿死
         match cmd_rx.try_recv() {
             Ok(CaptureCmd::SwitchMonitor(i)) => {
@@ -195,7 +420,15 @@ fn capture_thread(
                 let tw = Instant::now();
                 match cap.recv_timeout(Duration::from_millis(200)) {
                     Some(b) => (b, tw.elapsed().as_secs_f64() * 1000.0),
-                    None => continue, // 超时：回循环头看命令
+                    None => {
+                        // 采集线程已退出时 recv 会立刻返回（不等超时），据此识别后端死亡，
+                        // 交给监督层重建；否则会在这里空转到天荒地老，主控端画面永久停住
+                        if tw.elapsed() < Duration::from_millis(5) {
+                            error!("采集后端已退出（通道断开），重建采集");
+                            break CaptureOutcome::Restart;
+                        }
+                        continue; // 超时：回循环头看命令
+                    }
                 }
             }
         };
@@ -236,7 +469,7 @@ fn capture_thread(
 fn encode_loop(
     rx: std::sync::mpsc::Receiver<Prepared>,
     pool_tx: std::sync::mpsc::SyncSender<I420Frame>,
-    tx: tokio::sync::mpsc::UnboundedSender<Vec<u8>>,
+    tx: tokio::sync::mpsc::Sender<Vec<u8>>,
     fps: u64,
     w: i32,
     h: i32,
@@ -269,6 +502,9 @@ fn encode_loop(
     let mut last_idr = Instant::now();
     // 上次实际出帧的时刻（背压限频用）
     let mut last_emit = Instant::now();
+    // 上一次因码率变化重建编码器的时刻：限制最小间隔，避免 5s 内连续两次重建（文档 P1-A）
+    let mut last_enc_rebuild: Option<Instant> = None;
+    let mut last_keepalive_log = Instant::now();
     // 背压滞回状态：高水位进入限频，低水位退出
     let mut throttled = false;
     let mut frames_in: u64 = 0;
@@ -281,18 +517,62 @@ fn encode_loop(
     // 缓存的 SPS/PPS：关键帧若不自带参数集，则补在最前面（前端/解码器首次即可 configure）
     let mut sps: Option<Vec<u8>> = None;
     let mut pps: Option<Vec<u8>> = None;
+    // 负载自适应滞回计数（5s 一个统计窗口）
+    let mut bad_windows: u32 = 0;
+    let mut good_windows: u32 = 0;
 
-    while let Ok(p) = rx.recv() {
+    // 最后一帧的编码结果：桌面静止（WGC/DDA 不出帧）时按 2fps 重发，
+    // 否则主控端会停在最后一帧上，看起来像"死机"
+    let mut last_payload: Option<Vec<u8>> = None;
+
+    loop {
+        let p = match rx.recv_timeout(Duration::from_millis(300)) {
+            Ok(p) => p,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                if let Some(pl) = last_payload.as_ref() {
+                    if last_emit.elapsed() >= Duration::from_millis(500) {
+                        let _ = tx.try_send(pl.clone());
+                        last_emit = Instant::now();
+                        stats.touch_emit();
+                        frames_sent += 1;
+                        bytes_sent += pl.len() as u64;
+                        stats.frames.fetch_add(1, Ordering::Relaxed);
+                        // 显式日志：证明静止保活确实生效（文档 P1-B 要求可观测）
+                        if last_keepalive_log.elapsed() >= Duration::from_secs(10) {
+                            info!("💤 静止保活生效：桌面无新帧，每 500ms 重发最后一帧（约 2fps）");
+                            last_keepalive_log = Instant::now();
+                        }
+                        stats.bytes.fetch_add(pl.len() as u64, Ordering::Relaxed);
+                    }
+                }
+                continue;
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+        };
         // 动态码率：openh264 0.8 的 Encoder 不支持运行中改码率，
         // 目标偏差超过 8% 时重建编码器并强制下一帧 IDR（新 SPS/PPS 随 IDR 下发）
         let target = stats.bitrate.load(Ordering::Relaxed);
         if target != cur_bps {
             let drift = (target as f64 - cur_bps as f64).abs() / cur_bps.max(1) as f64;
-            // 阈值 8%：自适应每次升降幅度在 10%~50%，太小则改了目标却不重建编码器、实际码率不生效
-            if drift > 0.08 {
+            // 阈值 8%：自适应每次升降幅度在 10%~50%，太小则改了目标却不重建编码器、实际码率不生效。
+            // 上升方向限制最小间隔 10s（文档 P1-A：5s 内连续两次重建会明显掉帧）；
+            // 下降方向（拥塞）2s 即可生效，否则 AIMD 的快速回退会被编码器拖住。
+            let downshift = target < cur_bps;
+            let can_rebuild = last_enc_rebuild.map_or(true, |t| {
+                t.elapsed()
+                    >= if downshift {
+                        Duration::from_secs(2)
+                    } else {
+                        Duration::from_secs(10)
+                    }
+            }) || (stats.manual.load(Ordering::Relaxed) && last_enc_rebuild.is_none());
+            if drift > 0.08 && can_rebuild {
                 match Encoder::with_api_config(
                     OpenH264API::from_source(),
-                    encoder_config(target, fps),
+                    encoder_config(
+                        target,
+                        stats.fps_target.load(Ordering::Relaxed).max(1) as u64,
+                    ),
                 ) {
                     Ok(mut e2) => {
                         e2.force_intra_frame();
@@ -300,6 +580,8 @@ fn encode_loop(
                         sps = None;
                         pps = None;
                         cur_bps = target;
+                        last_enc_rebuild = Some(Instant::now());
+                        last_idr = Instant::now();
                         info!(
                             "🎚️ 码率调整 → {} kbps（编码器重建 + 强制 IDR）",
                             target / 1000
@@ -307,8 +589,13 @@ fn encode_loop(
                     }
                     Err(e) => warn!("编码器重建失败（保持 {cur_bps} bps）: {e}"),
                 }
-            } else {
+            } else if drift <= 0.08 {
                 cur_bps = target; // 小偏差不同步，避免频繁重建
+            } else {
+                debug!(
+                    "码率目标 {} kbps 已变化，但距上次重建不足 10s，延后生效",
+                    target / 1000
+                );
             }
         }
 
@@ -331,6 +618,14 @@ fn encode_loop(
             let _ = pool_tx.try_send(p.frame);
             skipped += 1;
             continue;
+        }
+
+        // 主控端丢帧后请求关键帧（M1）：与周期 IDR 互补，弱网下 2s 内自愈
+        let req = stats.keyframe_req.load(Ordering::Relaxed);
+        if req != stats.keyframe_done.load(Ordering::Relaxed) {
+            stats.keyframe_done.store(req, Ordering::Relaxed);
+            encoder.force_intra_frame();
+            info!("🖼️ 收到关键帧请求（累计 {req}），强制 IDR");
         }
 
         // 周期关键帧兜底：openh264 的 IntraFramePeriod 在本版本实测不生效
@@ -387,13 +682,30 @@ fn encode_loop(
             }
             payload.extend_from_slice(&raw);
             let len = payload.len() as u64;
-            if tx.send(payload).is_err() {
-                info!("接收端关闭，停止采集");
-                break;
+            let keepalive_copy = payload.clone();
+            match tx.try_send(payload) {
+                Ok(()) => {
+                    last_payload = Some(keepalive_copy);
+                }
+                Err(tokio::sync::mpsc::error::TrySendError::Full(p)) => {
+                    // 发送队列满：send_loop 被 DataChannel 背压卡住。
+                    // 这帧（通常是 P 帧）过了也不影响画面，丢了保低延迟。
+                    // 如果丢的是 I 帧，下一帧会被编码器自动判定为 P 帧——
+                    // 没关系，我们 2s 周期强制 IDR，最多 2 秒就出关键帧了。
+                    skipped += 1;
+                    // p 被丢弃，payload 随 p 一起 drop
+                    let _ = p;
+                    continue;
+                }
+                Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                    info!("接收端关闭，停止采集");
+                    break;
+                }
             }
             frames_sent += 1;
             bytes_sent += len;
             last_emit = Instant::now();
+            stats.touch_emit();
             if key {
                 last_idr = Instant::now();
             }
@@ -404,6 +716,9 @@ fn encode_loop(
         if last_log.elapsed() >= Duration::from_secs(5) {
             let secs = last_log.elapsed().as_secs_f64();
             let n = frames_in.max(1) as f64;
+            let avg_conv = conv_ms / n;
+            let avg_enc = enc_ms / n;
+            let fps_sent = frames_sent as f64 / secs;
             info!(
                 "📊 采集 {}x{} (backend={}) → {}x{}: {:.1} fps, {:.0} KB/s, 转换 {:.1} + 编码 {:.1} + 等帧 {:.1} ms/帧, 跳过 {}",
                 w,
@@ -411,12 +726,24 @@ fn encode_loop(
                 backend,
                 ew,
                 eh,
-                frames_sent as f64 / secs,
+                fps_sent,
                 bytes_sent as f64 / 1024.0 / secs,
-                conv_ms / n,
-                enc_ms / n,
+                avg_conv,
+                avg_enc,
                 wait_ms / n,
                 skipped
+            );
+            // 供主控端与降级判定使用的窗口均值
+            stats.conv_us.store((avg_conv * 1000.0) as u64, Ordering::Relaxed);
+            stats.enc_us.store((avg_enc * 1000.0) as u64, Ordering::Relaxed);
+            adapt_load(
+                &stats,
+                avg_conv,
+                avg_enc,
+                fps_sent,
+                frames_in,
+                &mut bad_windows,
+                &mut good_windows,
             );
             last_log = Instant::now();
             frames_in = 0;
@@ -450,91 +777,287 @@ fn encoder_config(bps: u32, fps: u64) -> openh264::encoder::EncoderConfig {
 }
 
 // ============================================================
-// async 发送任务：从采集线程收帧，[u32 seq][u32 len][payload...16KB] 发出
-// 每 5s 按 DataChannel 缓冲水位做码率自适应，并向主控端上报链路统计
+// 负载自适应：系统被外部任务（CUDA/CPU 密集）打满时降分辨率与帧率，
+// 保证远控"能看能操作"，负载回落后自动升回
 // ============================================================
+/// 某档位的实际目标帧率（帧率上限与基础帧率取小）
+fn level_fps(stats: &Stats, lvl: usize) -> u32 {
+    let base = stats.fps_base.load(Ordering::Relaxed).max(1);
+    let cap = DEGRADE_FPS_CAPS[lvl.min(2)];
+    if cap == 0 {
+        base
+    } else {
+        cap.min(base)
+    }
+}
+
+/// 切换降级档位：更新目标帧率/编码宽度，并自增 gen 让采集线程重建采集+编码
+fn apply_load_level(stats: &Stats, lvl: usize) {
+    let lvl = lvl.min(2);
+    stats.degrade.store(lvl as u32, Ordering::Relaxed);
+    stats.fps_target.store(level_fps(stats, lvl), Ordering::Relaxed);
+    set_active_width(level_width(lvl));
+    stats.epoch.fetch_add(1, Ordering::Relaxed);
+}
+
+/// 每 5s 统计窗口评估一次管线压力：
+/// - 转换 > 200ms 或 编码 > 30ms 或 fps < 目标 30% → 判为过载
+/// - 连续 2 个窗口过载 → 降一档
+/// - 连续 3 个窗口健康（转换 <50ms、编码 <20ms、fps > 目标 80%）→ 升一档
+fn adapt_load(
+    stats: &Stats,
+    conv_ms: f64,
+    enc_ms: f64,
+    fps: f64,
+    frames_in: u64,
+    bad: &mut u32,
+    good: &mut u32,
+) {
+    // 画面静止时 WGC 根本不出帧（这不是过载），窗口内没有输入帧就跳过判定
+    if frames_in == 0 {
+        *bad = 0;
+        *good = 0;
+        return;
+    }
+    let lvl = stats.degrade.load(Ordering::Relaxed).min(2) as usize;
+    let target = stats.fps_target.load(Ordering::Relaxed).max(1) as f64;
+    // 判据只看"真实处理耗时"：桌面静止时等帧长但转换/编码都很快，
+    // 那是"没帧可拿"（视频层已在做 2fps 保活），绝不能当成负载过高去降级重建
+    let overloaded = conv_ms > 50.0 || enc_ms > 30.0;
+    let healthy =
+        conv_ms < 20.0 && enc_ms < 15.0 && frames_in >= 5 && fps > target * 0.8;
+
+    if overloaded {
+        *bad += 1;
+        *good = 0;
+    } else if healthy {
+        *good += 1;
+        *bad = 0;
+    } else {
+        *bad = 0;
+        *good = 0;
+    }
+
+    if overloaded && lvl == 2 {
+        warn!(
+            "⚠️ 系统负载过高（转换 {conv_ms:.0}ms / 编码 {enc_ms:.0}ms / {fps:.1}fps），已是最低档，请结束抢占 CPU/GPU 的任务"
+        );
+    }
+
+    if *bad >= 2 && lvl < 2 {
+        let next = lvl + 1;
+        apply_load_level(stats, next);
+        warn!(
+            "⚠️ 系统负载过高（转换 {conv_ms:.0}ms / 编码 {enc_ms:.0}ms / {fps:.1}fps），已降级到 {}x{}@{}fps",
+            level_width(next),
+            level_width(next) * 9 / 16,
+            level_fps(stats, next)
+        );
+        *bad = 0;
+    } else if *good >= 3 && lvl > 0 {
+        let next = lvl - 1;
+        apply_load_level(stats, next);
+        info!(
+            "✅ 系统负载恢复，画质升回 {}x{}@{}fps",
+            level_width(next),
+            level_width(next) * 9 / 16,
+            level_fps(stats, next)
+        );
+        *good = 0;
+    }
+}
+
+/// 整机繁忙时默认优先级会被饿死（实测 python 占满 CPU 后转换 1.6ms → 14249ms），
+/// 远控恰恰是"机器卡了要远程处理"时最有价值的工具，进程提到 ABOVE_NORMAL
+fn boost_process_priority() {
+    unsafe {
+        use windows::Win32::System::Threading::{
+            GetCurrentProcess, SetPriorityClass, ABOVE_NORMAL_PRIORITY_CLASS,
+        };
+        let _ = SetPriorityClass(GetCurrentProcess(), ABOVE_NORMAL_PRIORITY_CLASS);
+    }
+    info!("⚡ 进程优先级已提升为 ABOVE_NORMAL");
+}
+
+// ============================================================
+// async 发送任务（M1）：媒体通道不可靠无序 + 1100B 分片 + 令牌桶 pacing
+// 队列深度 ≤2 帧，超出丢最旧；每 500ms 按主控端反馈做 AIMD 码率决策
+// ============================================================
+/// 发送队列深度上限（帧）。超出丢最旧的非关键帧
+pub const MAX_SEND_QUEUE: usize = 2;
+
+/// 入队并按 drop-oldest 裁剪：优先保留关键帧
+fn push_frame(queue: &mut VecDeque<Vec<u8>>, frame: Vec<u8>) {
+    queue.push_back(frame);
+    while queue.len() > MAX_SEND_QUEUE {
+        // 从最旧的开始找第一个非关键帧；全是关键帧时丢最旧的
+        let idx = queue
+            .iter()
+            .position(|f| f.first() != Some(&1))
+            .unwrap_or(0);
+        queue.remove(idx);
+    }
+}
+
+/// 令牌桶等待：按目标码率匀速放行 `len` 字节，避免瞬时打满 SCTP 缓冲
+async fn pace(tokens: &mut f64, last: &mut Instant, bps: u32, len: usize) {
+    let rate = bps.max(150_000) as f64 / 8.0; // B/s
+    let burst = (rate * 0.2).max(2.0 * crate::media::FRAG_BYTES as f64);
+    loop {
+        let now = Instant::now();
+        *tokens = (*tokens + now.duration_since(*last).as_secs_f64() * rate).min(burst);
+        *last = now;
+        if *tokens >= len as f64 {
+            *tokens -= len as f64;
+            return;
+        }
+        let wait = ((len as f64 - *tokens) / rate).min(0.05);
+        tokio::time::sleep(Duration::from_secs_f64(wait)).await;
+    }
+}
+
+/// `legacy=true` 时兼容 0.2.x 主控端：走旧 `[u32 seq][u32 len]` + 16KB 分片（无帧头、无 pacing）
 pub async fn send_loop(
     dc: Arc<webrtc::data_channel::RTCDataChannel>,
-    mut rx: tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>,
+    ctrl: Arc<webrtc::data_channel::RTCDataChannel>,
+    mut rx: tokio::sync::mpsc::Receiver<Vec<u8>>,
     stats: Arc<Stats>,
+    legacy: bool,
 ) -> Result<()> {
-    let seq = Arc::new(AtomicU32::new(0));
-    // 5s 一次：2s 周期在自适应上升期会每 2 秒重建一次编码器 + 强制 IDR（实测 6 连跳）
-    let mut tick = tokio::time::interval(Duration::from_secs(5));
-    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let seq = AtomicU32::new(0);
+    let mut tokens = 0f64;
+    let mut last_refill = Instant::now();
+    let mut queue: VecDeque<Vec<u8>> = VecDeque::with_capacity(MAX_SEND_QUEUE + 1);
+
+    // 500ms 一个决策周期（方案 4.4：反馈 200ms、决策 500ms）
     let mut last_frames = 0u32;
     let mut last_bytes = 0u64;
     let mut last_tick = Instant::now();
-    // 上一个周期的队列深度（估算链路吞吐用）
     let mut prev_buffered = 0u64;
+    let mut ticks: u32 = 0;
+
     loop {
+        // 定时决策：不放在 select 里，避免持续有帧时永远轮不到
+        if last_tick.elapsed() >= Duration::from_millis(500) {
+            let dt = last_tick.elapsed().as_secs_f32();
+            last_tick = Instant::now();
+            ticks += 1;
+            let f = stats.frames.load(Ordering::Relaxed);
+            let b = stats.bytes.load(Ordering::Relaxed);
+            let produced = b - last_bytes;
+            let fps = (f - last_frames) as f32 / dt;
+            let kbps = produced as f32 * 8.0 / (dt * 1000.0);
+            last_frames = f;
+            last_bytes = b;
+            let buffered = dc.buffered_amount().await as u64;
+            stats.backlog.store(buffered, Ordering::Relaxed);
+            // 队列下降量 = 链路真实吞吐（积压时比产出更能反映可用带宽）
+            let drained = produced + prev_buffered.saturating_sub(buffered);
+            prev_buffered = buffered;
+            adapt_bitrate(&stats, buffered, drained as f32 * 8.0 / (dt * 1000.0));
+            // 统计每 1s 上报一次（走 ctrl 可靠通道，不与媒体抢占）
+            if ticks % 2 == 0 {
+                let msg = ControlMsg::Stats { fps, kbps, buffered };
+                let _ = ctrl.send_text(msg.to_json()).await;
+            }
+        }
+
+        // 有积压时先发一帧：发帧期间到达的新帧在下一轮被 try_recv 收进来裁剪
+        if let Some(payload) = queue.pop_front() {
+            while let Ok(f) = rx.try_recv() {
+                push_frame(&mut queue, f);
+            }
+            let buffered = dc.buffered_amount().await as u64;
+            stats.backlog.store(buffered, Ordering::Relaxed);
+            send_frame(&dc, &mut tokens, &mut last_refill, &stats, &seq, &payload, legacy).await?;
+            continue;
+        }
         tokio::select! {
             recv = rx.recv() => {
-                let Some(payload) = recv else { break };
-                let seq_v = seq.fetch_add(1, Ordering::Relaxed);
-                let mut header = Vec::with_capacity(8);
-                header.extend_from_slice(&seq_v.to_le_bytes());
-                header.extend_from_slice(&(payload.len() as u32).to_le_bytes());
-                dc.send(&Bytes::from(header)).await.context("DC send header")?;
-                for chunk in payload.chunks(16_000) {
-                    dc.send(&Bytes::copy_from_slice(chunk)).await.context("DC send chunk")?;
-                }
-                // 把发送侧积压反馈给编码线程：队列涨起来就在编码前丢帧，压住延迟
-                stats.backlog.store(dc.buffered_amount().await as u64, Ordering::Relaxed);
+                let Some(frame) = recv else { break };
+                push_frame(&mut queue, frame);
             }
-            _ = tick.tick() => {
-                // interval 首次立即触发，按实际间隔算速率（不要假设固定 5s）
-                let dt = last_tick.elapsed().as_secs_f32();
-                if dt < 0.5 {
-                    continue;
-                }
-                last_tick = Instant::now();
-                let f = stats.frames.load(Ordering::Relaxed);
-                let b = stats.bytes.load(Ordering::Relaxed);
-                let fps = (f - last_frames) as f32 / dt;
-                let produced = b - last_bytes;
-                let kbps = produced as f32 * 8.0 / (dt * 1000.0);
-                last_frames = f;
-                last_bytes = b;
-                let buffered = dc.buffered_amount().await as u64;
-                stats.backlog.store(buffered, Ordering::Relaxed);
-                // 实际发出量 = 本周期产出 + 队列下降量，队列积压时它就等于链路真实吞吐
-                let drained = produced + prev_buffered.saturating_sub(buffered);
-                prev_buffered = buffered;
-                adapt_bitrate(&stats, buffered, drained as f32 * 8.0 / (dt * 1000.0));
-                let msg = ControlMsg::Stats { fps, kbps, buffered };
-                let _ = dc.send_text(msg.to_json()).await;
-            }
+            // 无帧时也能定期醒来做码率决策（静止保活 2fps 场景）
+            _ = tokio::time::sleep(Duration::from_millis(20)) => {}
         }
     }
     info!("发送循环结束（采集线程已关闭）");
     Ok(())
 }
 
-/// 码率自适应：
-/// - 队列延迟 >260ms 说明链路已饱和 → 目标码率对齐实测吞吐（90%），一个周期收敛
-/// - 队列延迟 <80ms 说明还有余量 → 按 1.5 倍缓升（5s 一档，2~3 档到顶），上限 4Mbps
-/// - 中间区间保持不动（滞回，避免频繁重建编码器）
-/// 全部按时间而非字节判断，慢链路（中继 ~300kbps）上才不会把"几秒延迟"当成"正常水位"
+/// 发送一整帧。
+/// - 新协议：1100B 分片 + 18B 帧头，逐片令牌桶 pacing；
+/// - legacy：0.2.x 的 `[u32 seq][u32 len]` 头 + 16KB 串行分片。
+async fn send_frame(
+    dc: &Arc<webrtc::data_channel::RTCDataChannel>,
+    tokens: &mut f64,
+    last_refill: &mut Instant,
+    stats: &Stats,
+    seq: &AtomicU32,
+    payload: &[u8],
+    legacy: bool,
+) -> Result<()> {
+    let key = payload.first() == Some(&1);
+    let seq_v = seq.fetch_add(1, Ordering::Relaxed);
+    if legacy {
+        let mut header = [0u8; 8];
+        header[..4].copy_from_slice(&seq_v.to_le_bytes());
+        header[4..].copy_from_slice(&(payload.len() as u32).to_le_bytes());
+        dc.send(&Bytes::copy_from_slice(&header))
+            .await
+            .context("DC send header")?;
+        for chunk in payload.chunks(16_000) {
+            dc.send(&Bytes::copy_from_slice(chunk))
+                .await
+                .context("DC send chunk")?;
+        }
+        return Ok(());
+    }
+    let bps = stats.bitrate.load(Ordering::Relaxed);
+    let ts = proc_ms() as u32;
+    for msg in crate::media::fragment_frame(seq_v, ts, key, 0, 0, payload) {
+        pace(tokens, last_refill, bps, msg.len()).await;
+        dc.send(&Bytes::from(msg)).await.context("媒体分片发送失败")?;
+    }
+    Ok(())
+}
+
+/// 应用层 AIMD（方案 4.4）：
+/// - 主控端反馈丢失 >3% 或队列延迟 >260ms → 码率 ×0.75（并参考实测吞吐）
+/// - 丢失 <1% 且队列健康 → 码率 ×1.15
+/// - 上限 8Mbps、下限 150kbps；主控端手动指定画质时不自动调整
 fn adapt_bitrate(stats: &Stats, buffered: u64, capacity_kbps: f32) {
-    // 主控端手动指定画质时不做自动调整
     if stats.manual.load(Ordering::Relaxed) {
         return;
     }
     let cur = stats.bitrate.load(Ordering::Relaxed);
-    // 同样按"队列延迟"判断：同样的 20KB，在 4Mbps 上是 40ms，在 300kbps 上是 533ms
+    let loss = stats.remote_loss_permille.load(Ordering::Relaxed) as f32 / 1000.0;
+    let recv_fps = stats.remote_fps_x10.load(Ordering::Relaxed) as f32 / 10.0;
+    // 队列延迟按当前码率折算成毫秒
     let queued_ms = buffered as f64 * 8000.0 / cur.max(150_000) as f64;
-    let next = if queued_ms > 260.0 {
-        // 下限 150kbps：慢链路（中继/弱网）上 400kbps 的地板会把队列顶满
-        ((capacity_kbps * 900.0) as u32).clamp(150_000, 4_000_000)
-    } else if queued_ms < 80.0 {
-        // 1.5 倍一档：10% 的档位要 6 次才能从 2M 爬到 4M，每次都重建编码器
-        (cur * 3 / 2).min(4_000_000)
+    let next = if loss > 0.03 || queued_ms > 260.0 {
+        let cut = (cur as f32 * 0.75) as u32;
+        if capacity_kbps > 100.0 {
+            cut.min((capacity_kbps * 900.0) as u32)
+        } else {
+            cut
+        }
+    } else if loss < 0.01 && queued_ms < 80.0 && recv_fps >= 10.0 {
+        // 静止画面（接收帧率很低）时不抬码率，避免恢复活动时突发 IDR 撑爆队列
+        (cur as f32 * 1.15) as u32
     } else {
         cur
     };
+    let next = next.clamp(150_000, 8_000_000);
     if next != cur {
         stats.bitrate.store(next, Ordering::Relaxed);
+        info!(
+            "🎛️ AIMD 码率 {} → {} kbps（丢帧 {:.1}%，队列 {:.0}ms）",
+            cur / 1000,
+            next / 1000,
+            loss * 100.0,
+            queued_ms
+        );
     }
 }
 
@@ -587,10 +1110,11 @@ pub const MAX_ENCODE_WIDTH: u32 = 1920;
 /// 为什么不强制对齐 16：1920x1080 本身不是 16 的倍数，硬对齐会把 1080 压成 1072；
 /// 而 16 对齐只省下不到一行宏块（约 1.5% 像素），收益远小于分辨率损失。
 pub fn target_size(sw: u32, sh: u32) -> (u32, u32) {
-    if sw <= MAX_ENCODE_WIDTH {
+    let cap = max_encode_width();
+    if cap == 0 || sw <= cap {
         return ((sw & !1).max(2), (sh & !1).max(2));
     }
-    let w = MAX_ENCODE_WIDTH & !1;
+    let w = cap & !1;
     let h = ((sh as u64 * w as u64 / sw as u64) as u32) & !1;
     (w, h.max(2))
 }

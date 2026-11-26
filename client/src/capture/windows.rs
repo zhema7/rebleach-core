@@ -3,7 +3,7 @@
 // 再拷进常驻 staging 纹理 Map 回读。只回读 1920x1200x4≈9.2MB，且直接拿到 BGRA，
 // 省掉 xcap 每帧新建 staging、全尺寸回读 + 两次 20MB 克隆 + 通道交换的开销。
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
 use std::time::{Duration, Instant};
 
@@ -13,6 +13,11 @@ use parking_lot::Mutex;
 /// start_for 入口先停掉上一个（设 stop 信号 + 等待短暂时间让旧线程退出），
 /// 然后再启动新的。保证 DDA / GDI / WGC 三种 backend 不会同时跑。
 static ACTIVE_STOP: Mutex<Option<Arc<AtomicBool>>> = Mutex::new(None);
+
+/// DDA 连续重建失败次数：达到阈值后本次进程不再尝试 DDA，直接回退 GDI。
+/// （实测故障时会以每秒数千次的频率重建复制会话，驱动级风暴把整台机器拖死）
+static DDA_FAILS: AtomicU32 = AtomicU32::new(0);
+const DDA_MAX_FAILS: u32 = 2;
 
 use anyhow::{Context, Result, anyhow};
 use tracing::{debug, info, warn};
@@ -185,6 +190,8 @@ pub struct Capture {
     pub src_h: u32,
     pub dst_w: u32,
     pub dst_h: u32,
+    /// 当前显示器设备名（\\.\DISPLAYn），主控端改分辨率时定位目标屏
+    pub name: String,
     /// 当前显示器左上角在虚拟桌面中的坐标（鼠标物理坐标映射用）
     pub origin_x: i32,
     pub origin_y: i32,
@@ -221,16 +228,36 @@ impl Capture {
 
         let mut monitors = enumerate();
         info!("🖥️ 枚举到 {} 个显示器", monitors.len());
-        if let Some(i) = monitor {
-            if i >= monitors.len() {
-                return Err(anyhow!(
-                    "显示器索引 {i} 超出范围（共 {} 个）",
-                    monitors.len()
-                ));
+        if monitor.is_none() {
+            // 未指定时优先物理屏：IDD 虚拟显示器（远程桌面/虚拟屏驱动）静止时
+            // 不产生呈现帧，DDA 会长时间拿不到帧，主控端看到的就是"卡死"。
+            monitors.sort_by_key(|m| (m.is_virtual, !m.primary));
+            if let Some(m) = monitors.first() {
+                if m.is_virtual {
+                    warn!(
+                        "🖥️ 只找到虚拟显示器 {}，桌面静止时帧率会明显下降",
+                        m.name
+                    );
+                }
             }
-            let m = monitors.swap_remove(i);
-            monitors.clear();
-            monitors.push(m);
+        }
+        if let Some(i) = monitor {
+            // 显示器拓扑变化（拔掉虚拟屏/休眠唤醒）后索引可能失效：
+            // 回退到 0 号屏继续采，不能让采集线程直接死掉（否则主控端黑屏）
+            let idx = if i >= monitors.len() {
+                warn!(
+                    "🖥️ 显示器索引 {i} 超出范围（共 {} 个），回退到 0 号屏",
+                    monitors.len()
+                );
+                0usize
+            } else {
+                i
+            };
+            if !monitors.is_empty() {
+                let m = monitors.swap_remove(idx);
+                monitors.clear();
+                monitors.push(m);
+            }
         }
 
         // —— 后端 1：DXGI 桌面复制 ——
@@ -281,6 +308,9 @@ impl Capture {
     /// 锁屏/UAC/分辨率切换会让复制会话失效（`DXGI_ERROR_ACCESS_LOST`），
     /// 线程内自动重建；重建期间画面由 `recv_timeout` 的 GDI 安全桌面兜底接管。
     fn start_dda(monitors: &[MonitorInfo]) -> Result<Self> {
+        if DDA_FAILS.load(Ordering::Relaxed) >= DDA_MAX_FAILS {
+            return Err(anyhow!("DDA 已连续故障，跳过直接回退 GDI"));
+        }
         let device = create_device()?;
         let context = unsafe { device.GetImmediateContext() }.context("取 D3D11 上下文失败")?;
         let mut last_err = anyhow!("没有可用显示器");
@@ -348,6 +378,7 @@ impl Capture {
                 src_h,
                 dst_w,
                 dst_h,
+                name: m.name.clone(),
                 origin_x: m.x,
                 origin_y: m.y,
                 pool: None,
@@ -470,6 +501,7 @@ impl Capture {
                 src_h,
                 dst_w,
                 dst_h,
+                name: m.name.clone(),
                 origin_x: m.x,
                 origin_y: m.y,
                 pool: Some(pool),
@@ -529,6 +561,7 @@ impl Capture {
             src_h,
             dst_w,
             dst_h,
+            name: m.name.clone(),
             origin_x: ox,
             origin_y: oy,
             pool: None,
@@ -753,7 +786,8 @@ fn find_output(device: &ID3D11Device, hmon: HMONITOR) -> Result<IDXGIOutput1> {
 /// DDA 采集线程：`AcquireNextFrame` 事件驱动 → GPU 缩放 → 回读 → 交给编码流水。
 ///
 /// 关键点：
-/// - 用 100ms 超时轮询，静止桌面时不会空转占满 CPU；有更新立即返回，不受 GDI 拷贝耗时限制。
+/// - 用 16ms 超时轮询（文档 P1-B）：有更新立即返回；静止桌面时也不会因为超时过长
+///   而把"新帧已经产生"拖到下一个 100ms 周期，降低交互延迟。
 /// - 复制会话在锁屏/UAC/分辨率切换后失效（ACCESS_LOST），这里自动重建，
 ///   重建期间由 `recv_timeout` 的 GDI 安全桌面兜底出帧。
 /// - 按目标帧率限速（高刷屏 120Hz 会把队列打满）。
@@ -776,41 +810,66 @@ fn dda_loop(
     let _ = (origin_x, origin_y); // 与 GDI 兜底共用 origin，这里不需要
     let mut buf: Vec<u8> = free_rx.try_recv().unwrap_or_else(|_| Vec::new());
     let mut last_warn: Option<Instant> = None;
-    let mut lost: u32 = 0;
+    // 重建次数与上次重建时刻：故障时 AcquireNextFrame 立刻返回 ACCESS_LOST、
+    // DuplicateOutput 却秒成功，不退避会形成每秒数千次的"重建→立即失效"驱动风暴
+    let mut rebuilds: u32 = 0;
+    let mut last_rebuild: Option<Instant> = None;
+    let mut gpu_ms_avg = 0.0f64;
+    let mut gpu_samples: u32 = 0;
     while !stop.load(Ordering::Relaxed) {
         let t0 = Instant::now();
         let mut info = DXGI_OUTDUPL_FRAME_INFO::default();
         let mut res: Option<IDXGIResource> = None;
-        let acquired = unsafe { dupl.AcquireNextFrame(100, &mut info, &mut res) };
+        let acquired = unsafe { dupl.AcquireNextFrame(16, &mut info, &mut res) };
         match acquired {
             Ok(()) => {
                 if let Some(r) = res.take() {
                     match r.cast::<ID3D11Texture2D>() {
-                        Ok(tex) => match gpu.convert_texture(&tex, &mut buf) {
-                            Ok(()) => {
-                                buf = {
-                                    let out = std::mem::take(&mut buf);
-                                    match tx.try_send(out) {
-                                        Ok(()) => free_rx.try_recv().unwrap_or_default(),
-                                        // 编码跟不上：丢弃本帧，取回缓冲继续
-                                        Err(std::sync::mpsc::TrySendError::Full(v)) => v,
-                                        Err(std::sync::mpsc::TrySendError::Disconnected(v)) => v,
-                                    }
-                                };
-                            }
-                            Err(e) => {
-                                if last_warn.is_none_or(|t| t.elapsed() >= Duration::from_secs(5)) {
-                                    warn!("DDA 帧转换失败（{name} {dst_w}x{dst_h}）: {e:#}");
-                                    last_warn = Some(Instant::now());
+                        Ok(tex) => {
+                            // 单独计时 GPU 下采样+回读：整机 GPU 被占满时这里会明显变长
+                            let tc = Instant::now();
+                            let cres = gpu.convert_texture(&tex, &mut buf);
+                            let conv_ms = tc.elapsed().as_secs_f64() * 1000.0;
+                            gpu_ms_avg += conv_ms;
+                            gpu_samples += 1;
+                            if gpu_samples >= 30 {
+                                let avg = gpu_ms_avg / gpu_samples as f64;
+                                if avg > 100.0 {
+                                    warn!(
+                                        "🖥️ GPU 下采样+回读偏慢（{name} 平均 {avg:.0}ms），GPU 可能被其它任务占满"
+                                    );
                                 }
-                                buf = tx_recover(buf, &free_rx);
+                                gpu_ms_avg = 0.0;
+                                gpu_samples = 0;
                             }
-                        },
+                            match cres {
+                                Ok(()) => {
+                                    buf = {
+                                        let out = std::mem::take(&mut buf);
+                                        match tx.try_send(out) {
+                                            Ok(()) => free_rx.try_recv().unwrap_or_default(),
+                                            // 编码跟不上：丢弃本帧，取回缓冲继续
+                                            Err(std::sync::mpsc::TrySendError::Full(v)) => v,
+                                            Err(std::sync::mpsc::TrySendError::Disconnected(v)) => v,
+                                        }
+                                    };
+                                }
+                                Err(e) => {
+                                    if last_warn
+                                        .is_none_or(|t| t.elapsed() >= Duration::from_secs(5))
+                                    {
+                                        warn!("DDA 帧转换失败（{name} {dst_w}x{dst_h}）: {e:#}");
+                                        last_warn = Some(Instant::now());
+                                    }
+                                    buf = tx_recover(buf, &free_rx);
+                                }
+                            }
+                        }
                         Err(e) => debug!("桌面复制资源转纹理失败: {e}"),
                     }
                 }
                 let _ = unsafe { dupl.ReleaseFrame() };
-                lost = 0;
+                rebuilds = 0;
                 // 限速到目标帧率
                 if let Some(rest) = interval.checked_sub(t0.elapsed()) {
                     std::thread::sleep(rest);
@@ -821,17 +880,33 @@ fn dda_loop(
                 if code == DXGI_ERROR_WAIT_TIMEOUT {
                     continue;
                 }
-                // 锁屏/UAC/分辨率切换后复制会话失效 → 重建
+                // 锁屏/UAC/分辨率切换/驱动异常后复制会话失效 → 退避重建
                 if code == DXGI_ERROR_ACCESS_LOST
                     || code == DXGI_ERROR_INVALID_CALL
                     || code == DXGI_ERROR_NOT_CURRENTLY_AVAILABLE
                 {
-                    lost += 1;
-                    if lost <= 3 {
-                        info!("🖥️ DDA 复制会话失效（{name}）：{e}，重建中");
+                    rebuilds += 1;
+                    // 关键：重建必须限速（两次至少间隔 500ms），否则会"重建→立刻失效"风暴
+                    if let Some(t) = last_rebuild {
+                        let elapsed = t.elapsed();
+                        if elapsed < Duration::from_millis(500) {
+                            std::thread::sleep(Duration::from_millis(500) - elapsed);
+                        }
+                    }
+                    last_rebuild = Some(Instant::now());
+                    if rebuilds <= 3 || rebuilds % 100 == 0 {
+                        warn!("🖥️ DDA 复制会话失效（{name}）：{e}，第 {rebuilds} 次重建");
+                    }
+                    if rebuilds > 10 {
+                        warn!(
+                            "🖥️ DDA 重建过于频繁（{name} 已达 {rebuilds} 次），放弃 DDA 回退 GDI"
+                        );
+                        DDA_FAILS.fetch_add(1, Ordering::Relaxed);
+                        break;
                     }
                     let mut ok = None;
-                    for _ in 0..25 {
+                    // 单次重建最多试 3 次、间隔 400ms（原来是 25×400ms，会卡住 10s 不出帧）
+                    for _ in 0..3 {
                         if stop.load(Ordering::Relaxed) {
                             break;
                         }
@@ -846,9 +921,17 @@ fn dda_loop(
                     match ok {
                         Some(d) => {
                             dupl = d;
-                            info!("🖥️ DDA 复制会话已重建（{name}）");
+                            if rebuilds <= 3 {
+                                info!("🖥️ DDA 复制会话已重建（{name}）");
+                            }
                         }
-                        None => warn!("🖥️ DDA 复制会话重建失败（{name}），本线程退出，等上层重建采集"),
+                        None => {
+                            warn!(
+                                "🖥️ DDA 复制会话重建失败（{name}），线程退出，等上层重建采集"
+                            );
+                            DDA_FAILS.fetch_add(1, Ordering::Relaxed);
+                            break;
+                        }
                     }
                     continue;
                 }
