@@ -222,6 +222,7 @@ ssh rbl-<device_id>
 ## 文档
 
 - [使用说明（GUI / CLI / SSH / 服务端接入）](docs/Rebleach-使用说明.md)
+- [Usage guide (English)](docs/Rebleach-Usage.md)
 
 ## License
 

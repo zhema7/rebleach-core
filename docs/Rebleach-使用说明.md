@@ -1,5 +1,7 @@
 # Rebleach 使用说明
 
+[English](Rebleach-Usage.md) | 简体中文
+
 版本：v0.5（T1–T4 + 服务端接入配置）
 适用系统：Windows 10 / 11 x64
 配套文档：《Rebleach 安装说明》（安装、托盘、PIN 等基础操作以该文档为准）

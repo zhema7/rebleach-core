@@ -204,8 +204,8 @@ ssh rbl-<device_id>
   `~/.ssh/config` contains `Include ~/.ssh/config.d/*.conf`.
 
 The agent syncs authorized keys from `/agent/ssh-keys` every 60 seconds into `ssh_authorized_keys`, so new grants take
-effect within one minute without restarting the service. See the [usage guide (Chinese)](docs/Rebleach-使用说明.md)
-for the full walkthrough.
+effect within one minute without restarting the service. See the [usage guide](docs/Rebleach-Usage.md) for the full
+walkthrough.
 
 ---
 
@@ -237,7 +237,8 @@ for the full walkthrough.
 
 ## Documentation
 
-- [Usage guide (Chinese: GUI / CLI / SSH / server enrollment)](docs/Rebleach-使用说明.md)
+- [Usage guide (English: GUI / CLI / SSH / server enrollment)](docs/Rebleach-Usage.md)
+- [使用说明（简体中文）](docs/Rebleach-使用说明.md)
 
 ## License
 
