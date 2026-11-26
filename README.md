@@ -1,5 +1,7 @@
 # Rebleach
 
+[English](README.en.md) | 简体中文
+
 基于 **Rust + WebRTC + Tauri** 的 Windows 远程控制方案。主控端为带界面的桌面程序（GUI），
 被控端是纯托盘 / Windows 服务的无窗口 Agent，两者共用同一套信令协议；
 同时提供命令行自动化（远程命令 / 端口转发 / SSH / Ansible）与服务端一键安装接入。
